@@ -1,0 +1,5 @@
+colors = ['BG', 'PANEL', 'CARD', 'ACCENT', 'GREEN', 'BLUE', 'GOLD', 'SILVER', 'BRONZE', 'TEAL', 'YELLOW', 'ORANGE', 'TEXT', 'DIM', 'BORDER', 'RED']
+fonts = ['F_H', 'F_M', 'F_N', 'F_S', 'F_XS']
+URLs = ['TESS_URL', 'POP_URL', 'HEADERS']
+cities = ['SEHIRLER']
+equipment_descriptions = ['TAKI_ACIKLAMA']
