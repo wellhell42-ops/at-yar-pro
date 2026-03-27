@@ -1,15 +1,17 @@
 """
-At Yarışı Pro Analiz  v12.0
+At Yarışı Pro Analiz  v13.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 • Yenibeygir günlük bülten otomatik çekim
 • Koşu → At listesi → Galop + Stil + Performans
+• TJK Trakus dereceleri çekimi + Tempo analizi
 • Tesseract + Poppler otomatik kurulum (PDF için)
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import threading, os, re, sys, zipfile, subprocess
+import threading, os, re, sys, zipfile, subprocess, json
 import urllib.request, urllib.error, urllib.parse
+import http.cookiejar
 from datetime import datetime, timedelta
 import pandas as pd
 
@@ -71,8 +73,15 @@ TAKI_ACIKLAMA = {
     "KBK":"Kör Başlık","T":"Tırnak","ÇR":"Çekildi",
 }
 
+TJK_SEHIR_ID = {
+    "istanbul": "1", "ankara": "2", "izmir": "3", "bursa": "4",
+    "adana": "5", "kocaeli": "6", "diyarbakir": "7", "elazig": "8",
+    "sanliurfa": "9", "konya": "10", "antalya": "11", "balikesir": "12",
+}
+
 _tess = None
 _pop  = None
+_tjk_opener = None
 
 
 # ─── Kurulum ──────────────────────────────────────────────
@@ -469,6 +478,437 @@ def scrape_profil(url: str) -> dict:
             "races": races, "pist_stats": pist_stats}
 
 
+# ─── TJK Trakus Scraper ─────────────────────────────────
+
+def _get_tjk_opener():
+    """TJK oturum yönetimli opener — cookie persistance."""
+    global _tjk_opener
+    if _tjk_opener is None:
+        cj = http.cookiejar.CookieJar()
+        _tjk_opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj))
+    return _tjk_opener
+
+
+def fetch_tjk(url: str, data: dict = None, timeout: int = 25) -> str:
+    """TJK.org session-aware fetch — önce ana sayfaya gidip cookie alır."""
+    opener = _get_tjk_opener()
+    hdrs = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "text/html, */*; q=0.01",
+        "Accept-Language": "tr-TR,tr;q=0.9",
+        "Referer": "https://www.tjk.org/TR/YarisSonuclari/Index",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    # Oturum oluştur (ilk ziyaret)
+    try:
+        init_req = urllib.request.Request(
+            "https://www.tjk.org/TR/YarisSonuclari/Index",
+            headers={k: v for k, v in hdrs.items()
+                     if k != "X-Requested-With"})
+        opener.open(init_req, timeout=timeout)
+    except Exception:
+        pass
+
+    if data:
+        encoded = urllib.parse.urlencode(data).encode("utf-8")
+        req = urllib.request.Request(url, data=encoded, headers=hdrs)
+        req.add_header("Content-Type",
+                       "application/x-www-form-urlencoded; charset=UTF-8")
+    else:
+        req = urllib.request.Request(url, headers=hdrs)
+    resp = opener.open(req, timeout=timeout)
+    return resp.read().decode("utf-8", errors="replace")
+
+
+def scrape_tjk_sonuclar(tarih: str, sehir: str) -> list:
+    """
+    TJK.org'dan günlük yarış sonuçlarını ve Trakus split verilerini çek.
+    Returns: [{kosu_no, mesafe, pist, atlar: [{at, jokey, sira, derece, fark,
+               splits:{200:t,400:t,...}, pozisyonlar:{200:p,400:p,...}}]}]
+    """
+    from bs4 import BeautifulSoup
+
+    sehir_low = sehir_url(sehir)
+    sehir_id = TJK_SEHIR_ID.get(sehir_low, "")
+    if not sehir_id:
+        raise Exception(f"TJK şehir bulunamadı: {sehir}")
+
+    parts = tarih.split(".")
+    tjk_tarih = f"{parts[0]}/{parts[1]}/{parts[2]}"
+
+    # Birden fazla endpoint dene (TJK yapısı değişebilir)
+    endpoints = [
+        ("https://www.tjk.org/TR/YarisSonuclari/Query/ConnectedPage/"
+         "GunlukYarisSonworker",
+         {"QueryParameter_Ession": "",
+          "QueryParameter_SehirId": sehir_id,
+          "QueryParameter_YarisGunu": tjk_tarih,
+          "QueryParameter_KosuNo": ""}),
+        (f"https://www.tjk.org/TR/YarisSonuclari/GunlukYarisSonuclari"
+         f"?SehirId={sehir_id}"
+         f"&YarisGunu={urllib.parse.quote(tjk_tarih)}", None),
+    ]
+
+    html = None
+    last_err = ""
+    for url, post_data in endpoints:
+        try:
+            html = fetch_tjk(url, post_data)
+            if html and len(html) > 500:
+                break
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    if not html or len(html) < 200:
+        raise Exception(
+            f"TJK'dan veri alınamadı.\n"
+            f"Şehir: {sehir} (ID: {sehir_id}), Tarih: {tarih}\n"
+            f"Hata: {last_err}\n\n"
+            f"TJK.org erişimi geçici engellenmiş olabilir."
+        )
+
+    soup = BeautifulSoup(html, "html.parser")
+    kosular = []
+
+    # ── Koşu meta (mesafe, pist) çıkarma ─────────────────
+    kosu_meta = {}
+    for elem in soup.find_all(["p", "div", "h2", "h3", "span", "strong"]):
+        txt = elem.get_text(" ", strip=True)
+        no_m = re.search(r"\b(\d{1,2})\s*\.\s*(?:Koşu|koşu|\d{2}:\d{2})", txt)
+        msf_m = re.search(r"(\d{3,5})\s*(Kum|Çim|Sentetik|Toprak)?", txt)
+        if no_m and msf_m:
+            kno = int(no_m.group(1))
+            kosu_meta[kno] = {
+                "mesafe": msf_m.group(1),
+                "pist": msf_m.group(2) or "",
+            }
+
+    # ── Tabloları parse et ─────────────────────────────────
+    tables = soup.find_all("table")
+    kosu_no = 0
+
+    for table in tables:
+        trs = table.find_all("tr")
+        if len(trs) < 3:
+            continue
+
+        # Header bul
+        header_cells = []
+        header_tr = None
+        for tr in trs:
+            cells = [c.get_text(strip=True)
+                     for c in tr.find_all(["th", "td"])]
+            has_at = any(c in ("At Adı", "At", "Atın Adı", "İsim")
+                         for c in cells)
+            has_dist = any(re.match(r"^\d{3,4}$", c) for c in cells)
+            has_derece = any(c in ("Derece", "Bitiş", "Der.") for c in cells)
+            has_sira = any(c in ("S.", "S", "Sıra") for c in cells)
+
+            if (has_at or has_sira) and (has_dist or has_derece):
+                header_cells = cells
+                header_tr = tr
+                break
+
+        if not header_cells:
+            continue
+
+        kosu_no += 1
+        hmap = {v: i for i, v in enumerate(header_cells)}
+
+        # Mesafe sütunlarını bul (200, 400, 600, 800, ...)
+        dist_cols = {}
+        for h in header_cells:
+            m = re.match(r"^(\d{3,4})$", h)
+            if m:
+                dist_cols[int(m.group(1))] = hmap[h]
+
+        atlar = []
+        for tr in trs:
+            if tr is header_tr:
+                continue
+            tds = tr.find_all("td")
+            if len(tds) < 4:
+                continue
+            cells = [td.get_text(" ", strip=True) for td in tds]
+
+            def _gc(*keys):
+                for k in keys:
+                    idx = hmap.get(k)
+                    if idx is not None and idx < len(cells):
+                        return cells[idx]
+                return ""
+
+            at_adi = _gc("At Adı", "At", "Atın Adı", "İsim")
+            if not at_adi or not re.search(
+                    r"[A-Za-zÇĞİÖŞÜçğıöşü]", at_adi):
+                continue
+
+            sira = _gc("S.", "S", "Sıra")
+            derece = _gc("Derece", "Bitiş", "Der.")
+            jokey = _gc("Jokey", "J.")
+            fark = _gc("Fark", "F.")
+            kilo = _gc("Kilo", "Kg")
+
+            # Trakus split zamanları parse et
+            splits = {}
+            pozisyonlar = {}
+            for dist, col_idx in sorted(dist_cols.items()):
+                if col_idx >= len(cells):
+                    continue
+                val = cells[col_idx].strip()
+                if not val or val == "-":
+                    continue
+                # Format: "2 (23.45)" → poz=2, zaman=23.45
+                m = re.match(r"(\d+)\s*[\(\[]"
+                             r"([\d]+[:\.,][\d\.]+)\s*[\)\]]", val)
+                if m:
+                    pozisyonlar[dist] = int(m.group(1))
+                    t_str = m.group(2).replace(",", ".")
+                    t_sec = galop_to_sec(t_str) or derece_to_sec(t_str)
+                    if t_sec:
+                        splits[dist] = t_sec
+                else:
+                    # Sadece süre veya sadece pozisyon
+                    t_sec = galop_to_sec(val) or derece_to_sec(val)
+                    if t_sec:
+                        splits[dist] = t_sec
+                    else:
+                        try:
+                            pozisyonlar[dist] = int(val)
+                        except ValueError:
+                            pass
+
+            atlar.append({
+                "at": at_adi.strip().upper(),
+                "sira": sira,
+                "jokey": jokey,
+                "derece": derece,
+                "fark": fark,
+                "kilo": kilo,
+                "splits": splits,
+                "pozisyonlar": pozisyonlar,
+            })
+
+        if atlar:
+            meta = kosu_meta.get(kosu_no, {})
+            kosular.append({
+                "kosu_no": kosu_no,
+                "mesafe": meta.get("mesafe", ""),
+                "pist": meta.get("pist", ""),
+                "atlar": atlar,
+            })
+
+    if not kosular:
+        raise Exception(
+            f"TJK sonuç tablosu parse edilemedi.\n"
+            f"Sayfa boyutu: {len(html)} byte\n"
+            f"Tablo sayısı: {len(tables)}\n\n"
+            f"Olası nedenler:\n"
+            f"• Bugün {sehir.title()}'da yarış yok veya henüz bitmedi\n"
+            f"• TJK sayfa yapısı değişmiş olabilir"
+        )
+
+    return kosular
+
+
+# ─── Tempo Analizi ───────────────────────────────────────
+
+def analiz_tempo(tjk_kosular: list, profiller: dict = None) -> dict:
+    """
+    Trakus split verilerinden + profil geçmişinden tempo analizi.
+
+    Çıktı (at bazında):
+      seksiyonlar     : [{baslangic, bitis, mesafe, sure, hiz_ms}]
+      ort_hiz, max_hiz, min_hiz
+      erken_pace, gec_pace, pace_fark
+      tempo_profil    : "🟢 KAPANIŞ" / "🔴 ERKEN TEMPO" / "🟡 DENGELİ"
+      son_200_hiz, son_400_hiz
+      tempo_skor      : 0-100
+      poz_degisim     : gained positions (+ = öne geçti)
+    """
+    result = {}
+
+    # ── 1) TJK Trakus verisi ──
+    for kosu in (tjk_kosular or []):
+        kosu_no = kosu["kosu_no"]
+        try:
+            kosu_mesafe = int(kosu.get("mesafe", "0"))
+        except (ValueError, TypeError):
+            kosu_mesafe = 0
+
+        for at_data in kosu.get("atlar", []):
+            at_adi = at_data["at"]
+            splits = at_data.get("splits", {})
+            pozlar = at_data.get("pozisyonlar", {})
+            derece = at_data.get("derece", "")
+
+            if not splits:
+                continue
+
+            distances = sorted(splits.keys())
+            if len(distances) < 2:
+                continue
+
+            seksiyonlar = []
+            prev_dist, prev_time = 0, 0.0
+            for dist in distances:
+                t = splits[dist]
+                s_dist = dist - prev_dist
+                s_time = t - prev_time
+                if s_time > 0 and s_dist > 0:
+                    seksiyonlar.append({
+                        "baslangic": prev_dist,
+                        "bitis": dist,
+                        "mesafe": s_dist,
+                        "sure": round(s_time, 2),
+                        "hiz_ms": round(s_dist / s_time, 2),
+                    })
+                prev_dist, prev_time = dist, t
+
+            # Son bölüm (son split → bitiş)
+            total_sec = derece_to_sec(derece)
+            if total_sec and distances and kosu_mesafe:
+                kalan_m = kosu_mesafe - distances[-1]
+                kalan_s = total_sec - splits[distances[-1]]
+                if kalan_s > 0.5 and kalan_m > 0:
+                    seksiyonlar.append({
+                        "baslangic": distances[-1],
+                        "bitis": kosu_mesafe,
+                        "mesafe": kalan_m,
+                        "sure": round(kalan_s, 2),
+                        "hiz_ms": round(kalan_m / kalan_s, 2),
+                    })
+
+            if not seksiyonlar:
+                continue
+
+            r = _tempo_hesapla(at_adi, kosu_no, at_data, seksiyonlar, pozlar)
+            result[at_adi] = r
+
+    # ── 2) Profil verilerinden tempo tahmini (Trakus yoksa) ──
+    if profiller:
+        for at_adi, profil in profiller.items():
+            if at_adi in result:
+                continue  # Trakus verisi varsa gerek yok
+            races = sorted(profil.get("races", []),
+                           key=lambda r: parse_date_key(r.get("tarih", "")),
+                           reverse=True)[:3]
+            for race in races:
+                d_sec = derece_to_sec(race.get("derece", ""))
+                try:
+                    msf = int(re.sub(r"[^\d]", "",
+                                     str(race.get("msf", "") or "")))
+                except (ValueError, TypeError):
+                    msf = 0
+                if not d_sec or not msf:
+                    continue
+
+                # Tahmini seksiyonel: eşit dağılım varsayımı + son bölüm
+                n_sec = max(2, msf // 200)
+                sec_dist = msf / n_sec
+                sec_time = d_sec / n_sec
+                base_hiz = msf / d_sec
+
+                seksiyonlar = []
+                for i in range(n_sec):
+                    # Erken bölüm biraz hızlı, son bölüm yavaşlar varsayımı
+                    frac = i / max(n_sec - 1, 1)
+                    mod = 1.03 - frac * 0.06  # %3 hızlı → %3 yavaş
+                    seksiyonlar.append({
+                        "baslangic": int(i * sec_dist),
+                        "bitis": int((i + 1) * sec_dist),
+                        "mesafe": int(sec_dist),
+                        "sure": round(sec_time / mod, 2),
+                        "hiz_ms": round(base_hiz * mod, 2),
+                    })
+
+                r = _tempo_hesapla(at_adi, 0,
+                                   {"sira": race.get("sira", ""),
+                                    "derece": race.get("derece", ""),
+                                    "fark": "", "jokey": race.get("jokey", ""),
+                                    "kilo": race.get("kilo", ""),
+                                    "splits": {}, "pozisyonlar": {}},
+                                   seksiyonlar, {},
+                                   kaynak="profil")
+                result[at_adi] = r
+                break  # ilk geçerli yarışı al
+
+    return result
+
+
+def _tempo_hesapla(at_adi, kosu_no, at_data, seksiyonlar, pozlar,
+                   kaynak="trakus"):
+    """Seksiyonel veriden tempo metrikleri hesapla."""
+    hizlar = [s["hiz_ms"] for s in seksiyonlar]
+    ort_hiz = sum(hizlar) / len(hizlar)
+    max_hiz = max(hizlar)
+    min_hiz = min(hizlar)
+
+    # Erken pace vs Geç pace
+    mid = len(seksiyonlar) // 2
+    if mid > 0 and len(seksiyonlar) > mid:
+        early = sum(s["hiz_ms"] for s in seksiyonlar[:mid]) / mid
+        late_n = len(seksiyonlar) - mid
+        late = sum(s["hiz_ms"] for s in seksiyonlar[mid:]) / late_n
+    else:
+        early = late = ort_hiz
+
+    pace_diff = late - early
+
+    if pace_diff > 0.4:
+        tempo_profil = "🟢 KAPANIŞ"
+    elif pace_diff < -0.4:
+        tempo_profil = "🔴 ERKEN TEMPO"
+    else:
+        tempo_profil = "🟡 DENGELİ"
+
+    son_200 = seksiyonlar[-1]["hiz_ms"] if seksiyonlar else None
+    son_400 = (sum(s["hiz_ms"] for s in seksiyonlar[-2:]) /
+               min(2, len(seksiyonlar))) if len(seksiyonlar) >= 2 else None
+
+    # Tempo skoru (0-100)
+    skor = 50.0
+    skor += min(20, pace_diff * 12)           # Kapanış bonusu
+    skor += min(15, (ort_hiz - 14) * 5)       # Genel hız
+    skor += min(10, (max_hiz - ort_hiz) * 8)  # Patlama gücü
+    if son_200 and son_200 > ort_hiz:
+        skor += 5
+    skor = round(max(0, min(100, skor)), 1)
+
+    # Pozisyon değişimi
+    poz_degisim = None
+    if pozlar:
+        poz_list = [(d, pozlar[d]) for d in sorted(pozlar.keys())]
+        if len(poz_list) >= 2:
+            poz_degisim = poz_list[0][1] - poz_list[-1][1]
+
+    return {
+        "at": at_adi,
+        "kosu_no": kosu_no,
+        "sira": at_data.get("sira", ""),
+        "derece": at_data.get("derece", ""),
+        "jokey": at_data.get("jokey", ""),
+        "kilo": at_data.get("kilo", ""),
+        "seksiyonlar": seksiyonlar,
+        "hizlar": hizlar,
+        "ort_hiz": round(ort_hiz, 2),
+        "max_hiz": round(max_hiz, 2),
+        "min_hiz": round(min_hiz, 2),
+        "erken_pace": round(early, 2),
+        "gec_pace": round(late, 2),
+        "pace_fark": round(pace_diff, 2),
+        "tempo_profil": tempo_profil,
+        "son_200_hiz": son_200,
+        "son_400_hiz": son_400,
+        "tempo_skor": skor,
+        "poz_degisim": poz_degisim,
+        "pozisyonlar": pozlar,
+        "kaynak": kaynak,
+    }
+
+
 # ─── Analiz ───────────────────────────────────────────────
 
 def galop_to_sec(t: str) -> float | None:
@@ -524,14 +964,17 @@ def analiz_galop(galop_rows: list, n: int = 4) -> dict:
 
 
 def analiz_stil(profil: dict) -> dict:
-    """Koşu stili + pist/mesafe tercihi."""
+    """Gelişmiş koşu stili analizi — mesafe, pist, form, tutarlılık."""
     races = profil.get("races", [])
     if not races:
-        return {"stil": "❓ Veri Yok", "stil_skor": 0}
+        return {"stil": "❓ Veri Yok", "stil_skor": 0, "stil_detay": "",
+                "mesafe_pref": "—", "kazanma_oran": 0, "tutarlilik": "—",
+                "form_notu": "—"}
 
     races = sorted(races, key=lambda r: parse_date_key(r.get("tarih","")), reverse=True)
 
     siralar, hizlar = [], []
+    mesafeler, pistler = [], []
     for r in races:
         try:
             s = int(re.sub(r"[^\d]","",r.get("sira","") or ""))
@@ -541,15 +984,80 @@ def analiz_stil(profil: dict) -> dict:
         if m:
             try: hizlar.append(int(m.group(1)))
             except: pass
+        # Mesafe
+        try:
+            msf = int(re.sub(r"[^\d]","",str(r.get("msf","") or "")))
+            if msf > 0: mesafeler.append(msf)
+        except: pass
+        # Pist
+        pist = str(r.get("pist","")).strip()
+        if pist: pistler.append(pist)
 
     ort_s = round(sum(siralar)/len(siralar),1) if siralar else 99
     ort_h = round(sum(hizlar)/len(hizlar),1)   if hizlar  else 0
     ilk3  = round(sum(1 for s in siralar if s<=3)/len(siralar)*100,1) if siralar else 0
+    kazanma = round(sum(1 for s in siralar if s==1)/len(siralar)*100,1) if siralar else 0
 
-    if ort_s <= 3.0:   stil = "🟢 ÖNDEN / LİDER"
-    elif ort_s <= 5.5: stil = "🟡 ORTADAN"
-    elif ort_h > 25:   stil = "🟡 ORTADAN / YÜKSELİCİ"
-    else:              stil = "🔵 GERİDEN / KAPICI"
+    # ── Gelişmiş stil sınıflandırma (7 tip) ─────────────
+    son5_s = siralar[:5]
+    son3_s = siralar[:3]
+    son3_h = hizlar[:3] if hizlar else []
+    ort_son3_s = sum(son3_s)/len(son3_s) if son3_s else 99
+    ort_son3_h = sum(son3_h)/len(son3_h) if son3_h else 0
+
+    if ort_s <= 2.5 and kazanma >= 25:
+        stil = "🟢 LİDER / DOMİNANT"
+        stil_detay = "Koşuyu baştan alıp kontrol eden, yüksek kazanma oranlı at"
+    elif ort_s <= 3.5:
+        stil = "🟢 ÖNDEN / ATACAKÇI"
+        stil_detay = "Erken pozisyon alan, ilk metrelerde güçlü çıkış yapan tip"
+    elif ort_s <= 5.0 and ort_h > 20:
+        stil = "🟡 ORTADAN / TAKİPÇİ"
+        stil_detay = "Liderleri takip edip son 400m'de atak yapan at"
+    elif ort_s <= 5.5 and ort_son3_s < ort_s:
+        stil = "🟡 YÜKSELİCİ / FORM"
+        stil_detay = "Son koşularında sıralaması yükselen, form yakalayan at"
+    elif ort_s <= 6.0:
+        stil = "🟠 ORTADAN / FIRSAT"
+        stil_detay = "Pozisyona göre yarışan, uygun tempoda şans bulan tip"
+    elif ort_h > 25 and ilk3 > 20:
+        stil = "🔵 GERİDEN / KAPICI"
+        stil_detay = "Son 200-400m'de patlayan, erken tempoya ihtiyaç duyan finişçi"
+    else:
+        stil = "🔵 GERİDEN / SABIRLI"
+        stil_detay = "Geride bekleyen, uzun mesafede dayanıklılıkla öne geçmeye çalışan at"
+
+    # ── Mesafe tercihi ─────────────────────────────────
+    mesafe_pref = "—"
+    if mesafeler:
+        from collections import Counter
+        mc = Counter()
+        for msf in mesafeler:
+            if msf <= 1200:   mc["Sprint (≤1200m)"] += 1
+            elif msf <= 1600: mc["Orta (1300-1600m)"] += 1
+            elif msf <= 2000: mc["Klasik (1700-2000m)"] += 1
+            else:             mc["Uzun (2000m+)"] += 1
+        best_msf = mc.most_common(1)[0]
+        mesafe_pref = f"{best_msf[0]} ({best_msf[1]} koşu)"
+
+    # ── Tutarlılık analizi ─────────────────────────────
+    tutarlilik = "—"
+    if len(siralar) >= 4:
+        std = (sum((s - ort_s)**2 for s in siralar) / len(siralar)) ** 0.5
+        if std <= 1.5:   tutarlilik = "🟢 ÇOK TUTARLI"
+        elif std <= 2.5: tutarlilik = "🟡 TUTARLI"
+        elif std <= 4.0: tutarlilik = "🟠 DALGALI"
+        else:            tutarlilik = "🔴 TUTARSIZ"
+
+    # ── Form notu (son 3 koşu) ─────────────────────────
+    if len(son3_s) >= 2:
+        if all(s <= 3 for s in son3_s):      form_notu = "🔥 ZİRVEDE"
+        elif ort_son3_s <= 3.0:               form_notu = "🟢 FORMDA"
+        elif ort_son3_s < ort_s:              form_notu = "📈 YÜKSELİYOR"
+        elif ort_son3_s > ort_s + 2:          form_notu = "📉 DÜŞÜŞTE"
+        else:                                  form_notu = "🟡 NORMAL"
+    else:
+        form_notu = "—"
 
     # Pist tercihi
     ps = profil.get("pist_stats",{})
@@ -561,6 +1069,13 @@ def analiz_stil(profil: dict) -> dict:
     if best_pist[0]:
         v = best_pist[1]
         pist_pref = f"{best_pist[0]} ({v.get('kosu',0)} koşu, hız={v.get('hiz',0)})"
+
+    # Pist bazlı kazanma
+    pist_kazanma = {}
+    for p in ["Kum","Çim","Sentetik"]:
+        pv = ps.get(p,{})
+        if pv.get("kosu",0) >= 1:
+            pist_kazanma[p] = f"{pv.get('1',0)}/{pv.get('kosu',0)}"
 
     # Takı
     taki_c = {}
@@ -575,14 +1090,20 @@ def analiz_stil(profil: dict) -> dict:
     son5 = "-".join(str(s) for s in siralar[:5]) if siralar else "—"
 
     return {
-        "stil":       stil,
-        "ort_sira":   ort_s,
-        "ort_hiz":    ort_h,
-        "ilk3_pct":   ilk3,
-        "son5":       son5,
-        "pist_pref":  pist_pref,
-        "taki":       taki_str,
-        "toplam_kosu":len(siralar),
+        "stil":         stil,
+        "stil_detay":   stil_detay,
+        "ort_sira":     ort_s,
+        "ort_hiz":      ort_h,
+        "ilk3_pct":     ilk3,
+        "kazanma_oran": kazanma,
+        "son5":         son5,
+        "pist_pref":    pist_pref,
+        "pist_kazanma": pist_kazanma,
+        "mesafe_pref":  mesafe_pref,
+        "tutarlilik":   tutarlilik,
+        "form_notu":    form_notu,
+        "taki":         taki_str,
+        "toplam_kosu":  len(siralar),
     }
 
 
@@ -621,7 +1142,7 @@ def analiz_perform(profil: dict, n: int = 5) -> dict:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("🏇  At Yarışı Pro Analiz  v12.0")
+        self.title("🏇  At Yarışı Pro Analiz  v13.0")
         self.geometry("1700x960")
         self.minsize(1200,720)
         self.configure(bg=BG)
@@ -634,6 +1155,8 @@ class App(tk.Tk):
         self.profiller  = {}      # {at: scrape_profil}
         self.stiller    = {}      # {at: analiz_stil}
         self.performlar = {}      # {at: analiz_perform}
+        self.tjk_trakus = []      # scrape_tjk_sonuclar sonucu
+        self.tempo_an   = {}      # analiz_tempo sonucu
         self._ready     = False
 
         self._build_ui()
@@ -752,6 +1275,9 @@ class App(tk.Tk):
         self.prog = ttk.Progressbar(bar, mode="indeterminate", length=120)
         self.prog.pack(side="left", padx=4)
 
+        tk.Frame(bar, bg=BORDER, width=1).pack(side="left", fill="y", padx=8)
+        btn("📡 TJK Trakus", self._cek_tjk_trakus, bg="#6C3483")
+
         # Export
         btn("💾 Excel", self.export_excel, bg="#145A32")
         btn("📄 CSV",   self.export_csv,   bg="#1A4F6E")
@@ -843,6 +1369,7 @@ class App(tk.Tk):
             ("  ⚡  Son 2 Yarış Hız  ",  self._build_son2hiz_tab),
             ("  👁  Takip Atları  ",     self._build_takip_tab),
             ("  🎬  Yarış Senaryosu  ", self._build_senaryo_tab),
+            ("  🏁  Trakus & Tempo  ",  self._build_trakus_tab),
         ]
         self.tab_frames = {}
         for name, builder in tabs:
@@ -922,12 +1449,22 @@ class App(tk.Tk):
         self.stil_horse_cb.pack(side="left", padx=6)
         self.stil_horse_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_stil_detail())
 
+        # Seçili at detay kartı
+        self.stil_detay_card = tk.Frame(top, bg=CARD, padx=10, pady=4,
+                                         highlightthickness=1,
+                                         highlightbackground=BORDER)
+        self.stil_detay_card.pack(side="left", padx=12)
+        self.stil_detay_lbl = tk.Label(self.stil_detay_card, text="",
+                                        font=F_XS, bg=CARD, fg=TEAL,
+                                        wraplength=500, justify="left")
+        self.stil_detay_lbl.pack()
+
         mid = tk.Frame(parent, bg=BG)
         mid.pack(fill="both", expand=True, padx=8)
 
         lp = tk.Frame(mid, bg=BG)
         lp.pack(side="left", fill="both", expand=True, padx=(0,6))
-        tk.Label(lp, text="Koşu Stili Özeti",
+        tk.Label(lp, text="Koşu Stili Analizi — Pro",
                  font=F_M, bg=BG, fg=TEXT).pack(anchor="w", pady=(0,4))
         self.tree_stil = self._make_tree(lp)
 
@@ -1541,6 +2078,7 @@ class App(tk.Tk):
         self._update_son2hiz()
         self._update_takip()
         self._update_senaryo()
+        self._update_trakus_tab()
 
     # ── Genel Analiz ─────────────────────────────────────
 
@@ -1749,46 +2287,65 @@ class App(tk.Tk):
 
     def _update_stil_tab(self):
         if not self.stiller: return
-        self.stil_status.set(f"✓ {len(self.stiller)} at analiz edildi")
+        self.stil_status.set(f"✓ {len(self.stiller)} at — stil + form + tutarlılık analizi")
         rows = []
         for at, s in self.stiller.items():
             rows.append({
                 "At":          at,
                 "Stil":        s.get("stil",""),
-                "Ort_Sira":    s.get("ort_sira",""),
-                "Ort_Hiz":     s.get("ort_hiz",""),
-                "Ilk3_%":      s.get("ilk3_pct",""),
+                "Form":        s.get("form_notu",""),
+                "Tutarlılık":  s.get("tutarlilik",""),
+                "Ort_Sıra":    s.get("ort_sira",""),
+                "İlk3_%":      s.get("ilk3_pct",""),
+                "Kazanma_%":   s.get("kazanma_oran",""),
                 "Son5":        s.get("son5",""),
-                "Pist_Pref":   s.get("pist_pref","")[:35] if s.get("pist_pref") else "",
-                "Taki":        s.get("taki","")[:45] if s.get("taki") else "",
-                "Kosu_Sayisi": s.get("toplam_kosu",""),
+                "Mesafe_Pref": s.get("mesafe_pref","")[:25] if s.get("mesafe_pref") else "",
+                "Pist_Pref":   s.get("pist_pref","")[:25] if s.get("pist_pref") else "",
+                "Ort_Hız":     s.get("ort_hiz",""),
+                "Takı":        s.get("taki","")[:30] if s.get("taki") else "",
+                "Koşu_Say":    s.get("toplam_kosu",""),
             })
         df = pd.DataFrame(rows)
         if not df.empty:
-            df = df.sort_values("Ilk3_%",
+            df = df.sort_values("İlk3_%",
                 key=lambda x: pd.to_numeric(x,errors="coerce").fillna(0),
                 ascending=False).reset_index(drop=True)
 
         def tag_fn(row, idx):
             s = str(row.get("Stil",""))
-            if "ÖNDEN" in s:  return "g1"
-            if "ORTADAN" in s: return "g2"
+            f = str(row.get("Form",""))
+            if "ZİRVEDE" in f or "FORMDA" in f: return "up"
+            if "DÜŞÜŞTE" in f: return "dn"
+            if "LİDER" in s or "DOMİNANT" in s:  return "g1"
+            if "ÖNDEN" in s or "ATACAKÇI" in s: return "g1"
+            if "ORTADAN" in s or "TAKİPÇİ" in s: return "g2"
+            if "YÜKSELİCİ" in s: return "st"
             if "GERİDEN" in s or "KAPICI" in s: return "g3"
             return "odd" if idx%2==0 else "ev"
 
         self._fill_tree(self.tree_stil, df, tag_fn=tag_fn)
 
-        # Kartlar
+        # Kartlar — stil dağılımı + form özeti
         for w in self.stil_cards.winfo_children(): w.destroy()
-        onderr  = sum(1 for s in self.stiller.values() if "ÖNDEN" in s.get("stil",""))
-        ortadan = sum(1 for s in self.stiller.values() if "ORTADAN" in s.get("stil",""))
+        onderr  = sum(1 for s in self.stiller.values()
+                      if "ÖNDEN" in s.get("stil","") or "LİDER" in s.get("stil",""))
+        ortadan = sum(1 for s in self.stiller.values()
+                      if "ORTADAN" in s.get("stil","") or "TAKİPÇİ" in s.get("stil","")
+                      or "YÜKSELİCİ" in s.get("stil","") or "FIRSAT" in s.get("stil",""))
         geriden = sum(1 for s in self.stiller.values()
-                      if "GERİDEN" in s.get("stil","") or "KAPICI" in s.get("stil",""))
+                      if "GERİDEN" in s.get("stil","") or "KAPICI" in s.get("stil","")
+                      or "SABIRLI" in s.get("stil",""))
+        formda  = sum(1 for s in self.stiller.values()
+                      if s.get("form_notu","") in ("🔥 ZİRVEDE","🟢 FORMDA","📈 YÜKSELİYOR"))
+        tutarli = sum(1 for s in self.stiller.values()
+                      if "TUTARLI" in str(s.get("tutarlilik","")) and "TUTARSIZ" not in str(s.get("tutarlilik","")))
         for lbl,val,col in [
-            ("🟢 Önden",   onderr,  GREEN),
-            ("🟡 Ortadan", ortadan, YELLOW),
-            ("🔵 Geriden", geriden, BLUE),
-            ("Toplam",     len(self.stiller), DIM),
+            ("🟢 Önden/Lider", onderr,  GREEN),
+            ("🟡 Ortadan",     ortadan, YELLOW),
+            ("🔵 Geriden",     geriden, BLUE),
+            ("🔥 Formda",      formda,  ORANGE),
+            ("📊 Tutarlı",     tutarli, TEAL),
+            ("Toplam",         len(self.stiller), DIM),
         ]:
             c = tk.Frame(self.stil_cards, bg=CARD,
                          highlightthickness=2, highlightbackground=col,
@@ -1805,9 +2362,26 @@ class App(tk.Tk):
 
     def _refresh_stil_detail(self):
         horse = self.stil_horse_var.get()
-        if not horse or horse=="Tümü" or horse not in self.profiller: return
+        if not horse or horse=="Tümü" or horse not in self.profiller:
+            self.stil_detay_lbl.config(text="")
+            return
         races = self.profiller[horse].get("races",[])
         if not races: return
+
+        # Detay kartı güncelle
+        s = self.stiller.get(horse, {})
+        detay_parts = [s.get("stil",""), " — ", s.get("stil_detay","")]
+        detay_parts.append(f"\nForm: {s.get('form_notu','—')}  |  "
+                           f"Tutarlılık: {s.get('tutarlilik','—')}  |  "
+                           f"Kazanma: %{s.get('kazanma_oran',0)}")
+        detay_parts.append(f"\nMesafe: {s.get('mesafe_pref','—')}  |  "
+                           f"Pist: {s.get('pist_pref','—')}")
+        pk = s.get("pist_kazanma",{})
+        if pk:
+            pk_str = "  ".join(f"{p}:{v}" for p,v in pk.items())
+            detay_parts.append(f"\nPist Kazanma: {pk_str}")
+        self.stil_detay_lbl.config(text="".join(detay_parts))
+
         df = pd.DataFrame(races)
         show = ["tarih","sehir","kcins","msf","pist","sira","derece","hiz","jokey","kilo","taki"]
         show = [c for c in show if c in df.columns]
@@ -3006,6 +3580,519 @@ class App(tk.Tk):
         delay = max(8, 130 - self.anim_hiz.get())
         self.after(delay, self._anim_step)
 
+    # ── Tab: Trakus & Tempo ──────────────────────────────
+
+    def _build_trakus_tab(self, parent):
+        # Üst açıklama
+        info_f = tk.Frame(parent, bg="#1A1A30")
+        info_f.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(info_f,
+                 text=("🏁  TRAKUS & TEMPO ANALİZİ  —  "
+                       "TJK Trakus GPS verileri veya profil derecelerinden "
+                       "seksiyonel hız, erken/geç pace, kapanış gücü ve "
+                       "tempo profili hesaplanır."),
+                 font=F_XS, bg="#1A1A30", fg=DIM, wraplength=1400,
+                 justify="left", padx=8, pady=4).pack(fill="x")
+
+        # Üst kontrol barı
+        ctrl = tk.Frame(parent, bg=BG)
+        ctrl.pack(fill="x", padx=8, pady=(6, 4))
+
+        tk.Button(ctrl, text="📡  TJK TRAKUS ÇEK",
+                  command=self._cek_tjk_trakus,
+                  bg="#6C3483", fg=TEXT, font=F_M, relief="flat",
+                  cursor="hand2", padx=14, pady=7).pack(side="left")
+
+        tk.Button(ctrl, text="📊  PROFİLDEN TEMPO",
+                  command=self._tempo_profilden,
+                  bg=BLUE, fg=TEXT, font=F_S, relief="flat",
+                  cursor="hand2", padx=10, pady=7).pack(side="left", padx=6)
+
+        self.trakus_info = tk.StringVar(
+            value="📡 TJK Trakus → split bazlı gerçek tempo  |  "
+                  "📊 Profil → derece bazlı tahmin  |  "
+                  "İlk önce bülteni çekip koşuyu analiz edin")
+        tk.Label(ctrl, textvariable=self.trakus_info,
+                 font=F_XS, bg=BG, fg=TEAL).pack(side="left", padx=12)
+
+        # Koşu seçici (TJK verileri için)
+        self.trakus_kosu_var = tk.StringVar(value="Tümü")
+        tk.Label(ctrl, text="Koşu:", font=F_XS, bg=BG, fg=DIM
+                 ).pack(side="left", padx=(16, 2))
+        self.trakus_kosu_cb = ttk.Combobox(
+            ctrl, textvariable=self.trakus_kosu_var,
+            state="readonly", width=10, font=F_N)
+        self.trakus_kosu_cb.pack(side="left", padx=4)
+        self.trakus_kosu_cb.bind("<<ComboboxSelected>>",
+                                  lambda e: self._refresh_trakus_tab())
+
+        # Podium
+        self.trakus_cards = tk.Frame(parent, bg=BG)
+        self.trakus_cards.pack(fill="x", padx=8, pady=(0, 6))
+
+        # Orta: tablo + grafik
+        mid = tk.Frame(parent, bg=BG)
+        mid.pack(fill="both", expand=True, padx=8)
+
+        # Sol: tempo tablosu
+        lp = tk.Frame(mid, bg=BG)
+        lp.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        tk.Label(lp, text="Tempo Analizi — Seksiyonel Hız & Pace Karşılaştırması",
+                 font=F_M, bg=BG, fg=TEXT).pack(anchor="w", pady=(0, 4))
+        self.tree_trakus = self._make_tree(lp)
+
+        # Sağ: grafik
+        rp = tk.Frame(mid, bg=BG, width=480)
+        rp.pack(side="left", fill="both")
+        rp.pack_propagate(False)
+        tk.Label(rp, text="Seksiyonel Hız Profili (m/s) — At Bazlı Çizgi Grafiği",
+                 font=F_M, bg=BG, fg=TEXT).pack(anchor="w", pady=(0, 4))
+        self.cv_trakus = tk.Canvas(rp, bg=PANEL,
+                                    highlightthickness=1,
+                                    highlightbackground=BORDER)
+        self.cv_trakus.pack(fill="both", expand=True)
+        self.cv_trakus.bind("<Configure>",
+                             lambda e: self._draw_trakus_chart())
+
+        # Alt: detay metin (daha geniş)
+        bt = tk.Frame(parent, bg=BG)
+        bt.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Label(bt, text="Tempo Raporu:", font=F_S, bg=BG, fg=GOLD
+                 ).pack(side="left")
+        self.txt_tempo = tk.Text(bt, bg=PANEL, fg=TEXT, font=F_XS,
+                                  height=7, relief="flat",
+                                  highlightthickness=1,
+                                  highlightbackground=BORDER,
+                                  state="disabled", wrap="word")
+        self.txt_tempo.pack(fill="x", expand=True, padx=(6, 0))
+
+    # ── TJK Trakus Çek ─────────────────────────────────────
+
+    def _cek_tjk_trakus(self):
+        if not self._ready:
+            messagebox.showwarning("Bekle", "Sistem hazırlanıyor.")
+            return
+        if not BS4:
+            messagebox.showerror("Hata", "beautifulsoup4 gerekli.")
+            return
+        tarih = self.e_tarih.get().strip()
+        sehir = self.sehir_var.get().strip()
+        if not tarih or not sehir:
+            messagebox.showwarning("Uyarı", "Tarih ve şehir seçin.")
+            return
+        threading.Thread(target=self._tjk_worker,
+                         args=(tarih, sehir), daemon=True).start()
+
+    def _tjk_worker(self, tarih, sehir):
+        self.prog.start(10)
+        self._st(f"TJK Trakus çekiliyor: {tarih} {sehir}…")
+        try:
+            kosular = scrape_tjk_sonuclar(tarih, sehir)
+            self.tjk_trakus = kosular
+            self._st(f"✓ TJK: {len(kosular)} koşu Trakus verisi çekildi")
+
+            # Tempo analizi
+            self._st("Tempo analizi yapılıyor…")
+            self.tempo_an = analiz_tempo(kosular, self.profiller or None)
+            self._st(f"✓ Tempo analizi: {len(self.tempo_an)} at")
+
+            self.after(0, self._on_trakus_done)
+        except Exception as e:
+            self.after(0, lambda e2=str(e):
+                       messagebox.showerror(
+                           "TJK Hatası",
+                           f"TJK Trakus çekilemedi:\n\n{e2}\n\n"
+                           f"Alternatif: 'Profilden Tempo' butonunu "
+                           f"kullanarak mevcut profillerden tempo "
+                           f"tahmini alabilirsiniz."))
+            self._st(f"TJK hatası: {e}")
+        finally:
+            self.prog.stop()
+
+    def _tempo_profilden(self):
+        """Mevcut profil verilerinden tempo analizi üret."""
+        if not self.profiller:
+            messagebox.showwarning(
+                "Veri Yok",
+                "Önce bir koşuyu analiz edin (profil verisi gerekli).")
+            return
+        self._st("Profilden tempo analizi yapılıyor…")
+        self.tempo_an = analiz_tempo([], self.profiller)
+        self._st(f"✓ Tempo analizi (profil): {len(self.tempo_an)} at")
+        self._on_trakus_done()
+
+    def _on_trakus_done(self):
+        """Trakus/Tempo verisi gelince tabloyu güncelle."""
+        # Koşu combobox
+        if self.tjk_trakus:
+            vals = ["Tümü"] + [f"{k['kosu_no']}. Koşu"
+                                for k in self.tjk_trakus]
+            self.trakus_kosu_cb["values"] = vals
+            self.trakus_kosu_var.set("Tümü")
+
+        self._refresh_trakus_tab()
+
+        # Trakus sekmesine geç (son sekme = index 9)
+        try:
+            self.nb.select(9)
+        except Exception:
+            pass
+
+    def _refresh_trakus_tab(self):
+        """Tempo tablosunu ve grafiğini güncelle."""
+        if not self.tempo_an:
+            return
+
+        # Koşu filtresi
+        secim = self.trakus_kosu_var.get()
+        if secim and secim not in ("Tümü",):
+            m = re.search(r"(\d+)", secim)
+            if m:
+                kno = int(m.group(1))
+                filtered = {k: v for k, v in self.tempo_an.items()
+                            if v.get("kosu_no") == kno}
+            else:
+                filtered = self.tempo_an
+        else:
+            filtered = self.tempo_an
+
+        # Tablo satırları — detaylı sütunlar
+        rows = []
+        for at, t in filtered.items():
+            # Hız farkı yorum
+            pf = t.get("pace_fark", 0) or 0
+            if pf > 0.5:     pace_yorum = "Güçlü kapanış"
+            elif pf > 0.2:   pace_yorum = "Hafif kapanış"
+            elif pf < -0.5:  pace_yorum = "Erken yorulma"
+            elif pf < -0.2:  pace_yorum = "Hafif düşüş"
+            else:             pace_yorum = "Dengeli"
+
+            # Hız aralığı (max-min)
+            hiz_aralik = ""
+            if t.get("max_hiz") and t.get("min_hiz"):
+                hiz_aralik = f"{t['max_hiz']-t['min_hiz']:.2f}"
+
+            row = {
+                "At": at,
+                "Tempo_Profili": t.get("tempo_profil", "—"),
+                "Tempo_Skor": t.get("tempo_skor", ""),
+                "Pace_Yorum": pace_yorum,
+                "Ort_Hız(m/s)": t.get("ort_hiz", ""),
+                "Max_Hız(m/s)": t.get("max_hiz", ""),
+                "Min_Hız(m/s)": t.get("min_hiz", ""),
+                "Hız_Aralık": hiz_aralik,
+                "Erken_Pace": t.get("erken_pace", ""),
+                "Geç_Pace": t.get("gec_pace", ""),
+                "Pace_Fark": t.get("pace_fark", ""),
+                "Son200(m/s)": t.get("son_200_hiz", ""),
+                "Son400(m/s)": t.get("son_400_hiz", ""),
+                "Sıra": t.get("sira", ""),
+                "Derece": t.get("derece", ""),
+                "Poz_Değişim": t.get("poz_degisim", "—"),
+                "Veri": "📡" if t.get("kaynak") == "trakus" else "📊",
+            }
+            rows.append(row)
+
+        df = pd.DataFrame(rows) if rows else pd.DataFrame()
+        if not df.empty:
+            df = df.sort_values(
+                "Tempo_Skor",
+                key=lambda x: pd.to_numeric(x, errors="coerce").fillna(0),
+                ascending=False).reset_index(drop=True)
+
+        def tag_fn(row, idx):
+            t = str(row.get("Tempo_Profili", ""))
+            if "KAPANIŞ" in t:
+                return "up"
+            if "ERKEN" in t:
+                return "dn"
+            if "DENGELİ" in t:
+                return "st"
+            if idx == 0:
+                return "g1"
+            if idx == 1:
+                return "g2"
+            if idx == 2:
+                return "g3"
+            return "odd" if idx % 2 == 0 else "ev"
+
+        self._fill_tree(self.tree_trakus, df, tag_fn=tag_fn)
+
+        # Podium
+        self._draw_trakus_podium(df.head(3).to_dict("records")
+                                  if not df.empty else [])
+
+        # Özet metin
+        self._write_tempo_ozet(filtered)
+
+        # Grafik
+        self.after(100, self._draw_trakus_chart)
+
+        n_trakus = sum(1 for v in filtered.values()
+                       if v.get("kaynak") == "trakus")
+        n_profil = sum(1 for v in filtered.values()
+                       if v.get("kaynak") == "profil")
+        self.trakus_info.set(
+            f"{len(filtered)} at analiz edildi  |  "
+            f"Trakus: {n_trakus}  |  Profil: {n_profil}")
+
+    def _draw_trakus_podium(self, top3):
+        for w in self.trakus_cards.winfo_children():
+            w.destroy()
+        if not top3:
+            return
+
+        tk.Label(self.trakus_cards, text="🏁  En İyi Tempo Performansı",
+                 font=F_M, bg=BG, fg=TEXT).pack(side="left", padx=(0, 16))
+
+        colors = [GOLD, SILVER, BRONZE]
+        medals = ["🥇", "🥈", "🥉"]
+        for i, row in enumerate(top3):
+            c = tk.Frame(self.trakus_cards, bg=CARD,
+                         highlightthickness=2,
+                         highlightbackground=colors[i],
+                         padx=14, pady=8)
+            c.pack(side="left", padx=(0, 10))
+            tk.Label(c, text=f"{medals[i]} {row.get('At', '')}",
+                     font=F_M, bg=CARD, fg=TEXT).pack()
+            tk.Label(c, text=f"Tempo: {row.get('Tempo_Skor', '—')}",
+                     font=("Segoe UI", 12, "bold"), bg=CARD,
+                     fg=colors[i]).pack()
+            det = (f"{row.get('Tempo_Profili', '')}  |  "
+                   f"Ort: {row.get('Ort_Hız(m/s)', '')} m/s")
+            tk.Label(c, text=det, font=F_XS, bg=CARD, fg=DIM
+                     ).pack(pady=(2, 0))
+
+    def _write_tempo_ozet(self, filtered):
+        """Detaylı tempo raporu — koşu yorumu seviyesinde."""
+        lines = []
+
+        if not filtered:
+            lines.append("Henüz tempo verisi yok. "
+                         "📡 TJK Trakus Çek veya 📊 Profilden Tempo butonunu kullanın.")
+        else:
+            n = len(filtered)
+            n_tr = sum(1 for v in filtered.values() if v.get("kaynak") == "trakus")
+            n_pr = sum(1 for v in filtered.values() if v.get("kaynak") == "profil")
+            lines.append(f"📋 TEMPO RAPORU  —  {n} at analiz edildi "
+                         f"(Trakus: {n_tr}, Profil: {n_pr})")
+            lines.append("─" * 60)
+
+            # ── Kapanış güçlü atlar ──
+            kapanis = [(at, t) for at, t in filtered.items()
+                        if (t.get("pace_fark") or 0) > 0.2]
+            kapanis.sort(key=lambda x: x[1].get("pace_fark", 0), reverse=True)
+            if kapanis:
+                lines.append("")
+                lines.append("🟢 KAPANIŞ GÜÇLÜ (Son bölümlerde hız artışı):")
+                for at, t in kapanis[:4]:
+                    pf = t.get("pace_fark", 0)
+                    s200 = t.get("son_200_hiz")
+                    s200_txt = f", Son200: {s200:.2f} m/s" if s200 else ""
+                    lines.append(
+                        f"   • {at}: Erken {t.get('erken_pace',0):.2f} → "
+                        f"Geç {t.get('gec_pace',0):.2f} m/s  "
+                        f"(+{pf:.2f} fark{s200_txt})")
+                lines.append("   → Uzun mesafe ve yüksek tempolu koşularda avantajlı. "
+                             "Erken pace yavaşsa bu atlar finalde fark yaratır.")
+
+            # ── Erken tempocular ──
+            erken = [(at, t) for at, t in filtered.items()
+                      if (t.get("pace_fark") or 0) < -0.2]
+            erken.sort(key=lambda x: x[1].get("pace_fark", 0))
+            if erken:
+                lines.append("")
+                lines.append("🔴 ERKEN TEMPO (Başta hızlı, sonda düşüş):")
+                for at, t in erken[:4]:
+                    pf = t.get("pace_fark", 0)
+                    lines.append(
+                        f"   • {at}: Erken {t.get('erken_pace',0):.2f} → "
+                        f"Geç {t.get('gec_pace',0):.2f} m/s  "
+                        f"({pf:.2f} fark)")
+                lines.append("   → Sprint mesafelerinde (≤1200m) ve az rakipli "
+                             "koşularda tercih edilir. Uzun mesafede risk.")
+
+            # ── Dengeli ──
+            dengeli = [(at, t) for at, t in filtered.items()
+                        if abs(t.get("pace_fark") or 0) <= 0.2]
+            if dengeli:
+                lines.append("")
+                ad = ", ".join(f"{a} ({t.get('ort_hiz',0):.2f})"
+                               for a, t in dengeli[:4])
+                lines.append(f"🟡 DENGELİ TEMPO: {ad}")
+                lines.append("   → Baştan sona sabit hız — her mesafe ve pistte "
+                             "tutarlı performans. Formda olduğunda güvenilir.")
+
+            # ── Seksiyonel rekorlar ──
+            lines.append("")
+            lines.append("─" * 60)
+
+            en_hizli = max(filtered.values(),
+                           key=lambda t: t.get("max_hiz", 0), default=None)
+            if en_hizli and en_hizli.get("max_hiz"):
+                lines.append(
+                    f"⚡ EN YÜKSEK SEKSİYONEL: {en_hizli['at']} → "
+                    f"{en_hizli['max_hiz']:.2f} m/s  "
+                    f"(patlama gücü yüksek)")
+
+            en_dusuk_min = min(filtered.values(),
+                                key=lambda t: t.get("min_hiz", 99), default=None)
+            if en_dusuk_min and en_dusuk_min.get("min_hiz"):
+                lines.append(
+                    f"🐢 EN DÜŞÜK SEKSİYONEL: {en_dusuk_min['at']} → "
+                    f"{en_dusuk_min['min_hiz']:.2f} m/s  "
+                    f"(zayıf bölüm)")
+
+            en_iyi = max(filtered.values(),
+                         key=lambda t: t.get("tempo_skor", 0), default=None)
+            if en_iyi:
+                lines.append(
+                    f"🏆 EN İYİ TEMPO SKORU: {en_iyi['at']} → "
+                    f"{en_iyi['tempo_skor']}  "
+                    f"({en_iyi.get('tempo_profil','')})")
+
+            # Ort. hız sıralaması
+            hiz_sirali = sorted(filtered.items(),
+                                 key=lambda x: x[1].get("ort_hiz", 0),
+                                 reverse=True)
+            if len(hiz_sirali) >= 2:
+                lines.append("")
+                lines.append("📊 ORT HIZ SIRALAMASI:")
+                for i, (at, t) in enumerate(hiz_sirali[:5], 1):
+                    lines.append(
+                        f"   {i}. {at}: {t.get('ort_hiz',0):.2f} m/s  "
+                        f"(max: {t.get('max_hiz',0):.2f})")
+
+        self.txt_tempo.config(state="normal")
+        self.txt_tempo.delete("1.0", "end")
+        self.txt_tempo.insert("end", "\n".join(lines))
+        self.txt_tempo.config(state="disabled")
+
+    def _draw_trakus_chart(self):
+        """Seksiyonel hız çoklu çizgi grafiği."""
+        cv = self.cv_trakus
+        cv.delete("all")
+        W = cv.winfo_width() or 460
+        H = cv.winfo_height() or 400
+        if not self.tempo_an or W < 100:
+            return
+
+        # Koşu filtresi
+        secim = self.trakus_kosu_var.get()
+        if secim and secim not in ("Tümü",):
+            m = re.search(r"(\d+)", secim)
+            if m:
+                kno = int(m.group(1))
+                filtered = {k: v for k, v in self.tempo_an.items()
+                            if v.get("kosu_no") == kno}
+            else:
+                filtered = self.tempo_an
+        else:
+            filtered = self.tempo_an
+
+        # En iyi 8 at (tempo skoruna göre)
+        items = sorted(filtered.items(),
+                       key=lambda x: x[1].get("tempo_skor", 0),
+                       reverse=True)[:8]
+        if not items:
+            cv.create_text(W // 2, H // 2,
+                           text="Tempo verisi yok",
+                           fill=DIM, font=F_M)
+            return
+
+        PL, PR, PT, PB = 55, 20, 40, 50
+
+        # Tüm hız değerlerini topla
+        all_hiz = []
+        max_seks = 0
+        for _, t in items:
+            hiz = t.get("hizlar", [])
+            all_hiz.extend(hiz)
+            max_seks = max(max_seks, len(hiz))
+
+        if not all_hiz or max_seks < 2:
+            cv.create_text(W // 2, H // 2,
+                           text="Yeterli seksiyonel veri yok",
+                           fill=DIM, font=F_M)
+            return
+
+        mn = min(all_hiz) - 0.3
+        mx = max(all_hiz) + 0.3
+        rng = max(mx - mn, 0.1)
+        xs = (W - PL - PR) / max(max_seks - 1, 1)
+
+        cv.create_text(W // 2, 20,
+                       text="Seksiyonel Hız Profili (m/s)",
+                       fill=TEXT, font=F_S)
+
+        # Grid
+        for frac in [0, 0.25, 0.5, 0.75, 1.0]:
+            val = mn + frac * rng
+            y = PT + (1 - frac) * (H - PT - PB)
+            cv.create_line(PL, y, W - PR, y, fill=BORDER, dash=(2, 5))
+            cv.create_text(PL - 5, y, text=f"{val:.1f}",
+                           fill=DIM, font=F_XS, anchor="e")
+
+        # Her at için çizgi çiz
+        for idx, (at, t) in enumerate(items):
+            hiz = t.get("hizlar", [])
+            if len(hiz) < 2:
+                continue
+            col = LINE_C[idx % len(LINE_C)]
+            seks = t.get("seksiyonlar", [])
+
+            pts = []
+            for i, h in enumerate(hiz):
+                x = PL + i * xs
+                y = PT + (1 - (h - mn) / rng) * (H - PT - PB)
+                pts.append((x, y))
+
+            # Çizgi
+            for i in range(len(pts) - 1):
+                cv.create_line(pts[i][0], pts[i][1],
+                               pts[i + 1][0], pts[i + 1][1],
+                               fill=col, width=2)
+
+            # Noktalar
+            for x, y in pts:
+                cv.create_oval(x - 3, y - 3, x + 3, y + 3,
+                               fill=col, outline=BG)
+
+            # İsim etiketi (son noktanın yanında)
+            if pts:
+                lx, ly = pts[-1]
+                cv.create_text(lx + 5, ly,
+                               text=at[:10],
+                               fill=col, font=F_XS, anchor="w")
+
+        # X ekseni etiketleri
+        for i in range(max_seks):
+            x = PL + i * xs
+            lbl = f"{(i + 1) * 200}m"
+            cv.create_text(x, H - PB + 14,
+                           text=lbl, fill=DIM, font=F_XS)
+
+        cv.create_line(PL, PT, PL, H - PB, fill=DIM)
+        cv.create_line(PL, H - PB, W - PR, H - PB, fill=DIM)
+
+        # Legend (sol alt)
+        for i, (at, _) in enumerate(items[:4]):
+            col = LINE_C[i % len(LINE_C)]
+            ly = H - PB + 28 + i * 14
+            cv.create_rectangle(PL, ly, PL + 10, ly + 10,
+                                fill=col, outline="")
+            cv.create_text(PL + 14, ly + 5,
+                           text=at[:14], fill=col,
+                           font=F_XS, anchor="w")
+
+    def _update_trakus_tab(self):
+        """Ana analiz akışı sonrası tempo analizini otomatik çalıştır."""
+        if self.profiller:
+            self.tempo_an = analiz_tempo(
+                self.tjk_trakus or [], self.profiller)
+            if self.tempo_an:
+                self._on_trakus_done()
+
     # ── Export ───────────────────────────────────────────
 
     def export_excel(self):
@@ -3041,6 +4128,23 @@ class App(tk.Tk):
             pd.DataFrame(rows).to_excel(w, index=False, sheet_name="Analiz")
             if self.galoplar:
                 pd.DataFrame(self.galoplar).to_excel(w, index=False, sheet_name="Galoplar")
+            if self.tempo_an:
+                tempo_rows = []
+                for at, t in self.tempo_an.items():
+                    tempo_rows.append({
+                        "At": at, "Tempo_Profil": t.get("tempo_profil",""),
+                        "Tempo_Skor": t.get("tempo_skor",""),
+                        "Ort_Hiz": t.get("ort_hiz",""),
+                        "Max_Hiz": t.get("max_hiz",""),
+                        "Erken_Pace": t.get("erken_pace",""),
+                        "Gec_Pace": t.get("gec_pace",""),
+                        "Pace_Fark": t.get("pace_fark",""),
+                        "Son200_Hiz": t.get("son_200_hiz",""),
+                        "Poz_Degisim": t.get("poz_degisim",""),
+                        "Kaynak": t.get("kaynak",""),
+                    })
+                pd.DataFrame(tempo_rows).to_excel(
+                    w, index=False, sheet_name="Tempo")
             for sheet in w.sheets.values():
                 for col in sheet.columns:
                     mx = max(len(str(c.value or "")) for c in col)
