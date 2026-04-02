@@ -1,9 +1,13 @@
 """
-At Yarışı Pro Analiz  v13.0
+At Yarışı Pro Analiz  v14.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 • Yenibeygir günlük bülten otomatik çekim
 • Koşu → At listesi → Galop + Stil + Performans
 • TJK Trakus dereceleri çekimi + Tempo analizi
+• Mesafe bazlı Trakus tempo referans verileri
+• Geçmiş yarış tarama + mesafe/pist uyum analizi
+• Jokey-at istatistikleri + momentum analizi
+• Kapsamlı genel yarış analizi (birleşik güç puanı)
 • Tesseract + Poppler otomatik kurulum (PDF için)
 """
 
@@ -82,6 +86,479 @@ TJK_SEHIR_ID = {
 _tess = None
 _pop  = None
 _tjk_opener = None
+
+# ─── Mesafe Bazlı Trakus Tempo Referans Verileri ─────────
+# Her mesafe ve pist tipi için referans derece, seksiyonel hız
+# ve tempo beklentileri.  Kaynaklar: TJK istatistikleri,
+# ortalama koşu dereceleri ve seksiyonel analizler.
+#
+# Yapı: MESAFE_TEMPO_REF[mesafe][pist] = {
+#   "ref_derece"    : (iyi, orta, zayıf)  — saniye cinsinden
+#   "ort_hiz_ms"    : (iyi, orta, zayıf)  — m/s
+#   "seksiyonlar"   : [(baslangic, bitis, ref_hiz_ms), ...]
+#   "tempo_tipi"    : beklenen tempo profili açıklaması
+#   "aciklama"      : mesafe karakteristiği
+# }
+
+MESAFE_TEMPO_REF = {
+    1000: {
+        "Kum": {
+            "ref_derece": (58.0, 61.0, 64.0),
+            "ort_hiz_ms": (17.24, 16.39, 15.63),
+            "seksiyonlar": [
+                (0, 200, 16.0), (200, 400, 17.2),
+                (400, 600, 17.5), (600, 800, 17.8),
+                (800, 1000, 17.0),
+            ],
+            "tempo_tipi": "Sprint — erken hız kritik, son 200m dayanıklılık",
+            "aciklama": "Kısa mesafe sprint koşusu. Çıkış hızı ve erken pozisyon belirleyici.",
+        },
+        "Çim": {
+            "ref_derece": (56.0, 59.0, 62.0),
+            "ort_hiz_ms": (17.86, 16.95, 16.13),
+            "seksiyonlar": [
+                (0, 200, 16.5), (200, 400, 17.8),
+                (400, 600, 18.0), (600, 800, 18.2),
+                (800, 1000, 17.5),
+            ],
+            "tempo_tipi": "Sprint — çimde daha hızlı tempolar beklenir",
+            "aciklama": "Çim pistte kısa mesafe. Zemin avantajı ile daha düşük dereceler.",
+        },
+        "Sentetik": {
+            "ref_derece": (57.5, 60.5, 63.5),
+            "ort_hiz_ms": (17.39, 16.53, 15.75),
+            "seksiyonlar": [
+                (0, 200, 16.2), (200, 400, 17.4),
+                (400, 600, 17.7), (600, 800, 18.0),
+                (800, 1000, 17.2),
+            ],
+            "tempo_tipi": "Sprint — sentetik pistte tutarlı zemin",
+            "aciklama": "Sentetik pistte kısa mesafe. Tutarlı zemin koşulları.",
+        },
+    },
+    1100: {
+        "Kum": {
+            "ref_derece": (64.5, 68.0, 71.5),
+            "ort_hiz_ms": (17.05, 16.18, 15.38),
+            "seksiyonlar": [
+                (0, 200, 15.8), (200, 400, 17.0),
+                (400, 600, 17.3), (600, 800, 17.5),
+                (800, 1100, 16.8),
+            ],
+            "tempo_tipi": "Kısa-orta mesafe — çıkış ve dayanıklılık dengesi",
+            "aciklama": "Sprint ile orta mesafe arası geçiş koşusu.",
+        },
+        "Çim": {
+            "ref_derece": (62.5, 66.0, 69.5),
+            "ort_hiz_ms": (17.60, 16.67, 15.83),
+            "seksiyonlar": [
+                (0, 200, 16.3), (200, 400, 17.5),
+                (400, 600, 17.8), (600, 800, 18.0),
+                (800, 1100, 17.3),
+            ],
+            "tempo_tipi": "Kısa-orta mesafe — çimde avantajlı",
+            "aciklama": "Çim pistte kısa-orta mesafe koşusu.",
+        },
+        "Sentetik": {
+            "ref_derece": (63.5, 67.0, 70.5),
+            "ort_hiz_ms": (17.32, 16.42, 15.60),
+            "seksiyonlar": [
+                (0, 200, 16.0), (200, 400, 17.2),
+                (400, 600, 17.5), (600, 800, 17.7),
+                (800, 1100, 17.0),
+            ],
+            "tempo_tipi": "Kısa-orta mesafe — sentetik zemin",
+            "aciklama": "Sentetik pistte kısa-orta mesafe koşusu.",
+        },
+    },
+    1200: {
+        "Kum": {
+            "ref_derece": (70.0, 73.5, 77.0),
+            "ort_hiz_ms": (17.14, 16.33, 15.58),
+            "seksiyonlar": [
+                (0, 200, 15.5), (200, 400, 16.8),
+                (400, 600, 17.2), (600, 800, 17.5),
+                (800, 1000, 17.3), (1000, 1200, 16.5),
+            ],
+            "tempo_tipi": "Sprint-orta — son 400m kapanış gücü önemli",
+            "aciklama": "Klasik sprint mesafesi. Hız ve dayanıklılık dengesi.",
+        },
+        "Çim": {
+            "ref_derece": (67.5, 71.0, 74.5),
+            "ort_hiz_ms": (17.78, 16.90, 16.11),
+            "seksiyonlar": [
+                (0, 200, 16.0), (200, 400, 17.3),
+                (400, 600, 17.8), (600, 800, 18.2),
+                (800, 1000, 18.0), (1000, 1200, 17.0),
+            ],
+            "tempo_tipi": "Sprint-orta — çimde yüksek tempo",
+            "aciklama": "Çim pistte sprint mesafesi. Daha hızlı dereceler.",
+        },
+        "Sentetik": {
+            "ref_derece": (69.0, 72.5, 76.0),
+            "ort_hiz_ms": (17.39, 16.55, 15.79),
+            "seksiyonlar": [
+                (0, 200, 15.7), (200, 400, 17.0),
+                (400, 600, 17.5), (600, 800, 17.8),
+                (800, 1000, 17.5), (1000, 1200, 16.7),
+            ],
+            "tempo_tipi": "Sprint-orta — sentetik zemin tutarlılığı",
+            "aciklama": "Sentetik pistte sprint mesafesi.",
+        },
+    },
+    1300: {
+        "Kum": {
+            "ref_derece": (77.0, 81.0, 85.0),
+            "ort_hiz_ms": (16.88, 16.05, 15.29),
+            "seksiyonlar": [
+                (0, 200, 15.2), (200, 400, 16.5),
+                (400, 600, 17.0), (600, 800, 17.3),
+                (800, 1000, 17.0), (1000, 1300, 16.2),
+            ],
+            "tempo_tipi": "Orta mesafe — tempolu koşu, kapanış belirleyici",
+            "aciklama": "Orta mesafe geçiş koşusu. Tempo yönetimi kritik.",
+        },
+        "Çim": {
+            "ref_derece": (74.5, 78.0, 82.0),
+            "ort_hiz_ms": (17.45, 16.67, 15.85),
+            "seksiyonlar": [
+                (0, 200, 15.8), (200, 400, 17.0),
+                (400, 600, 17.5), (600, 800, 17.8),
+                (800, 1000, 17.5), (1000, 1300, 16.8),
+            ],
+            "tempo_tipi": "Orta mesafe — çimde hızlı geçişler",
+            "aciklama": "Çim pistte orta mesafe koşusu.",
+        },
+        "Sentetik": {
+            "ref_derece": (76.0, 80.0, 84.0),
+            "ort_hiz_ms": (17.11, 16.25, 15.48),
+            "seksiyonlar": [
+                (0, 200, 15.5), (200, 400, 16.8),
+                (400, 600, 17.2), (600, 800, 17.5),
+                (800, 1000, 17.2), (1000, 1300, 16.5),
+            ],
+            "tempo_tipi": "Orta mesafe — sentetik zemin",
+            "aciklama": "Sentetik pistte orta mesafe koşusu.",
+        },
+    },
+    1400: {
+        "Kum": {
+            "ref_derece": (83.0, 87.5, 92.0),
+            "ort_hiz_ms": (16.87, 16.00, 15.22),
+            "seksiyonlar": [
+                (0, 200, 15.0), (200, 400, 16.2),
+                (400, 600, 16.8), (600, 800, 17.2),
+                (800, 1000, 17.0), (1000, 1200, 16.8),
+                (1200, 1400, 16.2),
+            ],
+            "tempo_tipi": "Orta mesafe — mile klasiği, dengeli tempo ideal",
+            "aciklama": "En popüler orta mesafe. Tempo kontrolü ve kapanış dengesi.",
+        },
+        "Çim": {
+            "ref_derece": (80.0, 84.0, 88.0),
+            "ort_hiz_ms": (17.50, 16.67, 15.91),
+            "seksiyonlar": [
+                (0, 200, 15.5), (200, 400, 16.8),
+                (400, 600, 17.3), (600, 800, 17.8),
+                (800, 1000, 17.8), (1000, 1200, 17.3),
+                (1200, 1400, 16.8),
+            ],
+            "tempo_tipi": "Orta mesafe — çimde mile klasiği",
+            "aciklama": "Çim pistte mile mesafesi. Yüksek kaliteli koşular.",
+        },
+        "Sentetik": {
+            "ref_derece": (82.0, 86.0, 90.0),
+            "ort_hiz_ms": (17.07, 16.28, 15.56),
+            "seksiyonlar": [
+                (0, 200, 15.2), (200, 400, 16.5),
+                (400, 600, 17.0), (600, 800, 17.5),
+                (800, 1000, 17.3), (1000, 1200, 17.0),
+                (1200, 1400, 16.5),
+            ],
+            "tempo_tipi": "Orta mesafe — sentetik mile",
+            "aciklama": "Sentetik pistte mile mesafesi.",
+        },
+    },
+    1500: {
+        "Kum": {
+            "ref_derece": (90.0, 95.0, 100.0),
+            "ort_hiz_ms": (16.67, 15.79, 15.00),
+            "seksiyonlar": [
+                (0, 200, 14.8), (200, 400, 16.0),
+                (400, 600, 16.5), (600, 800, 17.0),
+                (800, 1000, 17.0), (1000, 1200, 16.5),
+                (1200, 1500, 16.0),
+            ],
+            "tempo_tipi": "Orta-uzun — dayanıklılık ön plana çıkar",
+            "aciklama": "Orta-uzun mesafe. Dayanıklılık ve tempo yönetimi.",
+        },
+        "Çim": {
+            "ref_derece": (87.0, 91.5, 96.0),
+            "ort_hiz_ms": (17.24, 16.39, 15.63),
+            "seksiyonlar": [
+                (0, 200, 15.3), (200, 400, 16.5),
+                (400, 600, 17.0), (600, 800, 17.5),
+                (800, 1000, 17.5), (1000, 1200, 17.0),
+                (1200, 1500, 16.5),
+            ],
+            "tempo_tipi": "Orta-uzun — çim pistte",
+            "aciklama": "Çim pistte orta-uzun mesafe koşusu.",
+        },
+        "Sentetik": {
+            "ref_derece": (89.0, 93.5, 98.0),
+            "ort_hiz_ms": (16.85, 16.04, 15.31),
+            "seksiyonlar": [
+                (0, 200, 15.0), (200, 400, 16.2),
+                (400, 600, 16.7), (600, 800, 17.2),
+                (800, 1000, 17.2), (1000, 1200, 16.7),
+                (1200, 1500, 16.2),
+            ],
+            "tempo_tipi": "Orta-uzun — sentetik zemin",
+            "aciklama": "Sentetik pistte orta-uzun mesafe koşusu.",
+        },
+    },
+    1600: {
+        "Kum": {
+            "ref_derece": (97.0, 102.0, 107.0),
+            "ort_hiz_ms": (16.49, 15.69, 14.95),
+            "seksiyonlar": [
+                (0, 200, 14.5), (200, 400, 15.8),
+                (400, 600, 16.3), (600, 800, 16.8),
+                (800, 1000, 17.0), (1000, 1200, 16.8),
+                (1200, 1400, 16.3), (1400, 1600, 15.5),
+            ],
+            "tempo_tipi": "Uzun — enerji yönetimi ve kapanış zamanlaması",
+            "aciklama": "Uzun mesafe koşusu. Strateji ve dayanıklılık kritik.",
+        },
+        "Çim": {
+            "ref_derece": (93.5, 98.0, 103.0),
+            "ort_hiz_ms": (17.11, 16.33, 15.53),
+            "seksiyonlar": [
+                (0, 200, 15.0), (200, 400, 16.3),
+                (400, 600, 16.8), (600, 800, 17.3),
+                (800, 1000, 17.5), (1000, 1200, 17.3),
+                (1200, 1400, 16.8), (1400, 1600, 16.0),
+            ],
+            "tempo_tipi": "Uzun — çimde yüksek hız",
+            "aciklama": "Çim pistte uzun mesafe koşusu.",
+        },
+        "Sentetik": {
+            "ref_derece": (95.5, 100.5, 105.5),
+            "ort_hiz_ms": (16.75, 15.92, 15.17),
+            "seksiyonlar": [
+                (0, 200, 14.7), (200, 400, 16.0),
+                (400, 600, 16.5), (600, 800, 17.0),
+                (800, 1000, 17.2), (1000, 1200, 17.0),
+                (1200, 1400, 16.5), (1400, 1600, 15.7),
+            ],
+            "tempo_tipi": "Uzun — sentetik zemin",
+            "aciklama": "Sentetik pistte uzun mesafe koşusu.",
+        },
+    },
+    1800: {
+        "Kum": {
+            "ref_derece": (111.0, 117.0, 123.0),
+            "ort_hiz_ms": (16.22, 15.38, 14.63),
+            "seksiyonlar": [
+                (0, 200, 14.2), (200, 400, 15.5),
+                (400, 600, 16.0), (600, 800, 16.5),
+                (800, 1000, 16.8), (1000, 1200, 16.5),
+                (1200, 1400, 16.0), (1400, 1600, 15.5),
+                (1600, 1800, 15.0),
+            ],
+            "tempo_tipi": "Uzun — stayer karakteri, erken tempo riskli",
+            "aciklama": "Uzun mesafe. Erken tempoda yorulma riski yüksek.",
+        },
+        "Çim": {
+            "ref_derece": (107.0, 112.5, 118.0),
+            "ort_hiz_ms": (16.82, 16.00, 15.25),
+            "seksiyonlar": [
+                (0, 200, 14.7), (200, 400, 16.0),
+                (400, 600, 16.5), (600, 800, 17.0),
+                (800, 1000, 17.2), (1000, 1200, 17.0),
+                (1200, 1400, 16.5), (1400, 1600, 16.0),
+                (1600, 1800, 15.5),
+            ],
+            "tempo_tipi": "Uzun — çim pistte stayer",
+            "aciklama": "Çim pistte uzun mesafe stayer koşusu.",
+        },
+        "Sentetik": {
+            "ref_derece": (109.5, 115.0, 121.0),
+            "ort_hiz_ms": (16.44, 15.65, 14.88),
+            "seksiyonlar": [
+                (0, 200, 14.5), (200, 400, 15.7),
+                (400, 600, 16.2), (600, 800, 16.7),
+                (800, 1000, 17.0), (1000, 1200, 16.7),
+                (1200, 1400, 16.2), (1400, 1600, 15.7),
+                (1600, 1800, 15.2),
+            ],
+            "tempo_tipi": "Uzun — sentetik stayer",
+            "aciklama": "Sentetik pistte uzun mesafe koşusu.",
+        },
+    },
+    2000: {
+        "Kum": {
+            "ref_derece": (125.0, 132.0, 139.0),
+            "ort_hiz_ms": (16.00, 15.15, 14.39),
+            "seksiyonlar": [
+                (0, 200, 13.8), (200, 400, 15.0),
+                (400, 600, 15.5), (600, 800, 16.0),
+                (800, 1000, 16.5), (1000, 1200, 16.5),
+                (1200, 1400, 16.3), (1400, 1600, 16.0),
+                (1600, 1800, 15.5), (1800, 2000, 15.0),
+            ],
+            "tempo_tipi": "Uzun stayer — enerji tasarrufu ve geç kapanış",
+            "aciklama": "Klasik uzun mesafe. Sabırlı koşu ve güçlü kapanış.",
+        },
+        "Çim": {
+            "ref_derece": (120.5, 127.0, 133.5),
+            "ort_hiz_ms": (16.60, 15.75, 14.98),
+            "seksiyonlar": [
+                (0, 200, 14.3), (200, 400, 15.5),
+                (400, 600, 16.0), (600, 800, 16.5),
+                (800, 1000, 17.0), (1000, 1200, 17.0),
+                (1200, 1400, 16.8), (1400, 1600, 16.5),
+                (1600, 1800, 16.0), (1800, 2000, 15.5),
+            ],
+            "tempo_tipi": "Uzun stayer — çimde klasik mesafe",
+            "aciklama": "Çim pistte klasik uzun mesafe koşusu.",
+        },
+        "Sentetik": {
+            "ref_derece": (123.0, 130.0, 137.0),
+            "ort_hiz_ms": (16.26, 15.38, 14.60),
+            "seksiyonlar": [
+                (0, 200, 14.0), (200, 400, 15.2),
+                (400, 600, 15.7), (600, 800, 16.2),
+                (800, 1000, 16.7), (1000, 1200, 16.7),
+                (1200, 1400, 16.5), (1400, 1600, 16.2),
+                (1600, 1800, 15.7), (1800, 2000, 15.2),
+            ],
+            "tempo_tipi": "Uzun stayer — sentetik",
+            "aciklama": "Sentetik pistte uzun mesafe koşusu.",
+        },
+    },
+    2200: {
+        "Kum": {
+            "ref_derece": (139.0, 147.0, 155.0),
+            "ort_hiz_ms": (15.83, 14.97, 14.19),
+            "seksiyonlar": [
+                (0, 200, 13.5), (200, 400, 14.8),
+                (400, 600, 15.3), (600, 800, 15.8),
+                (800, 1000, 16.2), (1000, 1200, 16.5),
+                (1200, 1400, 16.3), (1400, 1600, 16.0),
+                (1600, 1800, 15.5), (1800, 2000, 15.0),
+                (2000, 2200, 14.5),
+            ],
+            "tempo_tipi": "Maraton tipi — yüksek dayanıklılık gerektirir",
+            "aciklama": "Çok uzun mesafe. Dayanıklılık ve soy kalitesi belirleyici.",
+        },
+        "Çim": {
+            "ref_derece": (133.5, 141.0, 148.5),
+            "ort_hiz_ms": (16.48, 15.60, 14.81),
+            "seksiyonlar": [
+                (0, 200, 14.0), (200, 400, 15.3),
+                (400, 600, 15.8), (600, 800, 16.3),
+                (800, 1000, 16.8), (1000, 1200, 17.0),
+                (1200, 1400, 16.8), (1400, 1600, 16.5),
+                (1600, 1800, 16.0), (1800, 2000, 15.5),
+                (2000, 2200, 15.0),
+            ],
+            "tempo_tipi": "Maraton tipi — çimde uzun mesafe",
+            "aciklama": "Çim pistte çok uzun mesafe koşusu.",
+        },
+        "Sentetik": {
+            "ref_derece": (136.5, 144.0, 152.0),
+            "ort_hiz_ms": (16.12, 15.28, 14.47),
+            "seksiyonlar": [
+                (0, 200, 13.7), (200, 400, 15.0),
+                (400, 600, 15.5), (600, 800, 16.0),
+                (800, 1000, 16.5), (1000, 1200, 16.7),
+                (1200, 1400, 16.5), (1400, 1600, 16.2),
+                (1600, 1800, 15.7), (1800, 2000, 15.2),
+                (2000, 2200, 14.7),
+            ],
+            "tempo_tipi": "Maraton tipi — sentetik",
+            "aciklama": "Sentetik pistte çok uzun mesafe koşusu.",
+        },
+    },
+    2400: {
+        "Kum": {
+            "ref_derece": (153.0, 162.0, 171.0),
+            "ort_hiz_ms": (15.69, 14.81, 14.04),
+            "seksiyonlar": [
+                (0, 200, 13.2), (200, 400, 14.5),
+                (400, 600, 15.0), (600, 800, 15.5),
+                (800, 1000, 16.0), (1000, 1200, 16.3),
+                (1200, 1400, 16.3), (1400, 1600, 16.0),
+                (1600, 1800, 15.5), (1800, 2000, 15.0),
+                (2000, 2200, 14.5), (2200, 2400, 14.0),
+            ],
+            "tempo_tipi": "Derby mesafesi — sabır, strateji ve soy kalitesi",
+            "aciklama": "Derby mesafesi. En yüksek dayanıklılık ve strateji.",
+        },
+        "Çim": {
+            "ref_derece": (147.0, 155.0, 163.0),
+            "ort_hiz_ms": (16.33, 15.48, 14.72),
+            "seksiyonlar": [
+                (0, 200, 13.7), (200, 400, 15.0),
+                (400, 600, 15.5), (600, 800, 16.0),
+                (800, 1000, 16.5), (1000, 1200, 16.8),
+                (1200, 1400, 16.8), (1400, 1600, 16.5),
+                (1600, 1800, 16.0), (1800, 2000, 15.5),
+                (2000, 2200, 15.0), (2200, 2400, 14.5),
+            ],
+            "tempo_tipi": "Derby mesafesi — çim pistte klasik",
+            "aciklama": "Çim pistte derby mesafesi koşusu.",
+        },
+        "Sentetik": {
+            "ref_derece": (150.5, 159.0, 167.5),
+            "ort_hiz_ms": (15.95, 15.09, 14.33),
+            "seksiyonlar": [
+                (0, 200, 13.5), (200, 400, 14.7),
+                (400, 600, 15.2), (600, 800, 15.7),
+                (800, 1000, 16.2), (1000, 1200, 16.5),
+                (1200, 1400, 16.5), (1400, 1600, 16.2),
+                (1600, 1800, 15.7), (1800, 2000, 15.2),
+                (2000, 2200, 14.7), (2200, 2400, 14.2),
+            ],
+            "tempo_tipi": "Derby mesafesi — sentetik zemin",
+            "aciklama": "Sentetik pistte derby mesafesi koşusu.",
+        },
+    },
+}
+
+def mesafe_tempo_bilgisi(mesafe: int, pist: str = "") -> dict | None:
+    """Verilen mesafe ve pist tipi için referans tempo bilgisini döndür."""
+    # Tam eşleşme
+    if mesafe in MESAFE_TEMPO_REF:
+        ref = MESAFE_TEMPO_REF[mesafe]
+        if pist and pist in ref:
+            return ref[pist]
+        # Pist bulunamazsa ilk mevcut olanı döndür
+        for p in ("Kum", "Çim", "Sentetik"):
+            if p in ref:
+                return ref[p]
+    # En yakın mesafeyi bul
+    if MESAFE_TEMPO_REF:
+        en_yakin = min(MESAFE_TEMPO_REF.keys(),
+                       key=lambda m: abs(m - mesafe))
+        if abs(en_yakin - mesafe) <= 100:
+            ref = MESAFE_TEMPO_REF[en_yakin]
+            if pist and pist in ref:
+                return ref[pist]
+            for p in ("Kum", "Çim", "Sentetik"):
+                if p in ref:
+                    return ref[p]
+    return None
+
+
+def derece_formatla(saniye: float) -> str:
+    """Saniyeyi M.SS.D formatına çevir."""
+    if saniye >= 60:
+        m = int(saniye // 60)
+        s = saniye - m * 60
+        return f"{m}.{s:05.2f}"
+    return f"{saniye:.2f}"
 
 
 # ─── Kurulum ──────────────────────────────────────────────
@@ -784,7 +1261,10 @@ def analiz_tempo(tjk_kosular: list, profiller: dict = None) -> dict:
             if not seksiyonlar:
                 continue
 
-            r = _tempo_hesapla(at_adi, kosu_no, at_data, seksiyonlar, pozlar)
+            kosu_pist = kosu.get("pist", "")
+            r = _tempo_hesapla(at_adi, kosu_no, at_data, seksiyonlar,
+                               pozlar, kosu_mesafe=kosu_mesafe,
+                               kosu_pist=kosu_pist)
             result[at_adi] = r
 
     # ── 2) Profil verilerinden tempo tahmini (Trakus yoksa) ──
@@ -824,6 +1304,8 @@ def analiz_tempo(tjk_kosular: list, profiller: dict = None) -> dict:
                         "hiz_ms": round(base_hiz * mod, 2),
                     })
 
+                pist_raw = re.sub(r"[\d\s]", "",
+                                   str(race.get("msf", "") or "")).strip()
                 r = _tempo_hesapla(at_adi, 0,
                                    {"sira": race.get("sira", ""),
                                     "derece": race.get("derece", ""),
@@ -831,7 +1313,9 @@ def analiz_tempo(tjk_kosular: list, profiller: dict = None) -> dict:
                                     "kilo": race.get("kilo", ""),
                                     "splits": {}, "pozisyonlar": {}},
                                    seksiyonlar, {},
-                                   kaynak="profil")
+                                   kaynak="profil",
+                                   kosu_mesafe=msf,
+                                   kosu_pist=pist_raw)
                 result[at_adi] = r
                 break  # ilk geçerli yarışı al
 
@@ -839,8 +1323,8 @@ def analiz_tempo(tjk_kosular: list, profiller: dict = None) -> dict:
 
 
 def _tempo_hesapla(at_adi, kosu_no, at_data, seksiyonlar, pozlar,
-                   kaynak="trakus"):
-    """Seksiyonel veriden tempo metrikleri hesapla."""
+                   kaynak="trakus", kosu_mesafe=0, kosu_pist=""):
+    """Seksiyonel veriden tempo metrikleri hesapla + mesafe referans karşılaştırması."""
     hizlar = [s["hiz_ms"] for s in seksiyonlar]
     ort_hiz = sum(hizlar) / len(hizlar)
     max_hiz = max(hizlar)
@@ -884,6 +1368,36 @@ def _tempo_hesapla(at_adi, kosu_no, at_data, seksiyonlar, pozlar,
         if len(poz_list) >= 2:
             poz_degisim = poz_list[0][1] - poz_list[-1][1]
 
+    # ── Mesafe Referans Karşılaştırması ──
+    ref = mesafe_tempo_bilgisi(kosu_mesafe, kosu_pist) if kosu_mesafe else None
+    ref_seviye = "—"
+    ref_fark = None
+    ref_seks_karne = []
+    if ref:
+        ref_iyi, ref_orta, ref_zayif = ref["ort_hiz_ms"]
+        if ort_hiz >= ref_iyi:
+            ref_seviye = "🟢 İYİ"
+        elif ort_hiz >= ref_orta:
+            ref_seviye = "🟡 ORTA"
+        else:
+            ref_seviye = "🔴 ZAYIF"
+        ref_fark = round(ort_hiz - ref_orta, 2)
+
+        # Her seksiyonu referansa kıyasla
+        ref_seks = ref.get("seksiyonlar", [])
+        for i, sek in enumerate(seksiyonlar):
+            if i < len(ref_seks):
+                r_hiz = ref_seks[i][2]
+                fark = round(sek["hiz_ms"] - r_hiz, 2)
+                durum = "+" if fark > 0.2 else ("-" if fark < -0.2 else "=")
+                ref_seks_karne.append({
+                    "bolum": f"{sek['baslangic']}-{sek['bitis']}m",
+                    "gercek": sek["hiz_ms"],
+                    "referans": r_hiz,
+                    "fark": fark,
+                    "durum": durum,
+                })
+
     return {
         "at": at_adi,
         "kosu_no": kosu_no,
@@ -906,6 +1420,11 @@ def _tempo_hesapla(at_adi, kosu_no, at_data, seksiyonlar, pozlar,
         "poz_degisim": poz_degisim,
         "pozisyonlar": pozlar,
         "kaynak": kaynak,
+        "kosu_mesafe": kosu_mesafe,
+        "kosu_pist": kosu_pist,
+        "ref_seviye": ref_seviye,
+        "ref_fark": ref_fark,
+        "ref_seks_karne": ref_seks_karne,
     }
 
 
@@ -938,33 +1457,97 @@ def sec_fmt(s: float | None) -> str:
 
 
 def analiz_galop(galop_rows: list, n: int = 4) -> dict:
-    """At bazında son N galop analizi."""
+    """At bazında son N galop analizi — tüm mesafe dereceleri + trend."""
     if not galop_rows: return {}
     df = pd.DataFrame(galop_rows)
     df["_date"] = df["g_tarih"].apply(parse_date_key)
-    df["_400s"] = df["400"].apply(galop_to_sec)
+
+    mesafe_cols = ["400","600","800","1000","1200","1400"]
+    for col in mesafe_cols:
+        if col in df.columns:
+            df[f"_{col}s"] = df[col].apply(galop_to_sec)
 
     result = {}
     for at, grp in df.groupby("at"):
         grp   = grp.sort_values("_date", ascending=False)
         son_n = grp.head(n)
-        vals  = son_n["_400s"].dropna()
+        vals_400 = son_n["_400s"].dropna() if "_400s" in son_n.columns else pd.Series()
+
+        # Tüm mesafe dereceleri
+        mesafe_analiz = {}
+        for col in mesafe_cols:
+            scol = f"_{col}s"
+            if scol in son_n.columns:
+                vals = son_n[scol].dropna()
+                if not vals.empty:
+                    mesafe_analiz[col] = {
+                        "en_iyi": round(vals.min(), 2),
+                        "ort":    round(vals.mean(), 2),
+                        "son":    round(vals.iloc[0], 2) if len(vals) > 0 else None,
+                        "sayi":   len(vals),
+                    }
+
+        # 400m galop trend tespiti (son 3+ galop)
+        galop_trend = "—"
+        galop_trend_skor = 0.0
+        if "_400s" in grp.columns:
+            trend_vals = grp["_400s"].dropna().head(5).tolist()
+            if len(trend_vals) >= 3:
+                son = sum(trend_vals[:2]) / 2
+                eski = sum(trend_vals[-2:]) / 2
+                galop_trend_skor = round(eski - son, 2)  # pozitif = iyileşme
+                if galop_trend_skor > 0.3:
+                    galop_trend = "🟢 HIZLANIYOR"
+                elif galop_trend_skor < -0.3:
+                    galop_trend = "🔴 YAVAŞLIYOR"
+                else:
+                    galop_trend = "🟡 STABİL"
+
+        # Galop yoğunluğu (son kaç günde kaç galop)
+        toplam_galop = len(grp)
+        gun_fark = gun_farki(grp["g_tarih"].iloc[0])
+        galop_yogunluk = "—"
+        if gun_fark is not None and gun_fark <= 7 and toplam_galop >= 3:
+            galop_yogunluk = "🔥 YOĞUN"
+        elif gun_fark is not None and gun_fark <= 14 and toplam_galop >= 2:
+            galop_yogunluk = "🟢 AKTİF"
+        elif gun_fark is not None and gun_fark <= 21:
+            galop_yogunluk = "🟡 NORMAL"
+        elif gun_fark is not None:
+            galop_yogunluk = "⚫ SOĞUK"
+
+        # Pist ve şehir bazlı galop
+        pist_galop = {}
+        sehir_galop = {}
+        for _, row in son_n.iterrows():
+            p = str(row.get("pist", "")).strip()
+            s = str(row.get("g_sehir", "")).strip()
+            if p:
+                pist_galop[p] = pist_galop.get(p, 0) + 1
+            if s:
+                sehir_galop[s] = sehir_galop.get(s, 0) + 1
 
         result[at] = {
-            "at":          at,
-            "galop_sayisi":len(grp),
-            "son_n":       n,
-            "en_iyi_400":  round(vals.min(),2) if not vals.empty else None,
-            "ort_400":     round(vals.mean(),2) if not vals.empty else None,
-            "son_tarih":   grp["g_tarih"].iloc[0],
-            "gun_fark":    gun_farki(grp["g_tarih"].iloc[0]),
-            "rows":        son_n.to_dict("records"),
+            "at":            at,
+            "galop_sayisi":  toplam_galop,
+            "son_n":         n,
+            "en_iyi_400":    round(vals_400.min(), 2) if not vals_400.empty else None,
+            "ort_400":       round(vals_400.mean(), 2) if not vals_400.empty else None,
+            "son_tarih":     grp["g_tarih"].iloc[0],
+            "gun_fark":      gun_fark,
+            "rows":          son_n.to_dict("records"),
+            "mesafe_analiz": mesafe_analiz,
+            "galop_trend":   galop_trend,
+            "galop_trend_skor": galop_trend_skor,
+            "galop_yogunluk": galop_yogunluk,
+            "pist_galop":    pist_galop,
+            "sehir_galop":   sehir_galop,
         }
     return result
 
 
-def analiz_stil(profil: dict) -> dict:
-    """Gelişmiş koşu stili analizi — mesafe, pist, form, tutarlılık."""
+def analiz_stil(profil: dict, kosu_mesafe: int = 0, kosu_pist: str = "") -> dict:
+    """Gelişmiş koşu stili analizi — mesafe uyumu, jokey, pist, form, tutarlılık, geçmiş tarama."""
     races = profil.get("races", [])
     if not races:
         return {"stil": "❓ Veri Yok", "stil_skor": 0, "stil_detay": "",
@@ -975,6 +1558,7 @@ def analiz_stil(profil: dict) -> dict:
 
     siralar, hizlar = [], []
     mesafeler, pistler = [], []
+    dereceler, jokeyler = [], []
     for r in races:
         try:
             s = int(re.sub(r"[^\d]","",r.get("sira","") or ""))
@@ -992,6 +1576,12 @@ def analiz_stil(profil: dict) -> dict:
         # Pist
         pist = str(r.get("pist","")).strip()
         if pist: pistler.append(pist)
+        # Derece
+        d = derece_to_sec(r.get("derece",""))
+        if d: dereceler.append(d)
+        # Jokey
+        j = str(r.get("jokey","")).strip()
+        if j: jokeyler.append(j)
 
     ort_s = round(sum(siralar)/len(siralar),1) if siralar else 99
     ort_h = round(sum(hizlar)/len(hizlar),1)   if hizlar  else 0
@@ -1028,26 +1618,110 @@ def analiz_stil(profil: dict) -> dict:
         stil_detay = "Geride bekleyen, uzun mesafede dayanıklılıkla öne geçmeye çalışan at"
 
     # ── Mesafe tercihi ─────────────────────────────────
+    from collections import Counter
     mesafe_pref = "—"
+    mesafe_detay = {}
     if mesafeler:
-        from collections import Counter
         mc = Counter()
-        for msf in mesafeler:
-            if msf <= 1200:   mc["Sprint (≤1200m)"] += 1
-            elif msf <= 1600: mc["Orta (1300-1600m)"] += 1
-            elif msf <= 2000: mc["Klasik (1700-2000m)"] += 1
-            else:             mc["Uzun (2000m+)"] += 1
+        msf_siralar = {}  # mesafe grubu → sıra listesi
+        for i, msf in enumerate(mesafeler):
+            if msf <= 1200:   grp_name = "Sprint (≤1200m)"
+            elif msf <= 1600: grp_name = "Orta (1300-1600m)"
+            elif msf <= 2000: grp_name = "Klasik (1700-2000m)"
+            else:             grp_name = "Uzun (2000m+)"
+            mc[grp_name] += 1
+            if i < len(siralar):
+                msf_siralar.setdefault(grp_name, []).append(siralar[i])
         best_msf = mc.most_common(1)[0]
         mesafe_pref = f"{best_msf[0]} ({best_msf[1]} koşu)"
 
+        # Her mesafe grubundaki ortalama sıra
+        for grp_name, slist in msf_siralar.items():
+            ort = round(sum(slist) / len(slist), 1)
+            ilk3_g = sum(1 for s in slist if s <= 3)
+            mesafe_detay[grp_name] = {
+                "kosu": len(slist), "ort_sira": ort,
+                "ilk3": ilk3_g,
+                "kazanma": sum(1 for s in slist if s == 1),
+            }
+
+    # ── Mesafe uyumu (bugünkü koşu mesafesiyle) ─────────
+    mesafe_uyumu = "—"
+    mesafe_uyum_skor = 0
+    if kosu_mesafe and mesafeler:
+        # Bu mesafe aralığındaki geçmiş performans
+        benzer = [(siralar[i] if i < len(siralar) else 99)
+                  for i, msf in enumerate(mesafeler)
+                  if abs(msf - kosu_mesafe) <= 200]
+        if benzer:
+            ort_benzer = sum(benzer) / len(benzer)
+            ilk3_benzer = sum(1 for s in benzer if s <= 3) / len(benzer) * 100
+            if ilk3_benzer >= 50:
+                mesafe_uyumu = f"🟢 ÇOK İYİ ({len(benzer)} koşu, ort:{ort_benzer:.1f})"
+                mesafe_uyum_skor = 3
+            elif ilk3_benzer >= 25:
+                mesafe_uyumu = f"🟡 İYİ ({len(benzer)} koşu, ort:{ort_benzer:.1f})"
+                mesafe_uyum_skor = 2
+            elif ort_benzer <= 5:
+                mesafe_uyumu = f"🟡 ORTA ({len(benzer)} koşu, ort:{ort_benzer:.1f})"
+                mesafe_uyum_skor = 1
+            else:
+                mesafe_uyumu = f"🔴 ZAYIF ({len(benzer)} koşu, ort:{ort_benzer:.1f})"
+                mesafe_uyum_skor = 0
+        else:
+            mesafe_uyumu = "⚫ DENEYİMSİZ (bu mesafede koşu yok)"
+
+    # ── Pist uyumu (bugünkü piste göre) ─────────────────
+    pist_uyumu = "—"
+    pist_uyum_skor = 0
+    if kosu_pist and pistler:
+        pist_benzer = [(siralar[i] if i < len(siralar) else 99)
+                       for i, p in enumerate(pistler) if p == kosu_pist]
+        if pist_benzer:
+            ort_p = sum(pist_benzer) / len(pist_benzer)
+            ilk3_p = sum(1 for s in pist_benzer if s <= 3) / len(pist_benzer) * 100
+            if ilk3_p >= 40:
+                pist_uyumu = f"🟢 GÜÇLÜ ({len(pist_benzer)} koşu, %{ilk3_p:.0f} ilk3)"
+                pist_uyum_skor = 2
+            elif ort_p <= 5:
+                pist_uyumu = f"🟡 NORMAL ({len(pist_benzer)} koşu, ort:{ort_p:.1f})"
+                pist_uyum_skor = 1
+            else:
+                pist_uyumu = f"🔴 ZAYIF ({len(pist_benzer)} koşu, ort:{ort_p:.1f})"
+        else:
+            pist_uyumu = "⚫ DENEYİMSİZ"
+
+    # ── Jokey analizi ──────────────────────────────────
+    jokey_istatistik = {}
+    if jokeyler:
+        jc = Counter(jokeyler)
+        for jokey, sayi in jc.most_common(5):
+            j_siralar = [siralar[i] for i, j in enumerate(jokeyler)
+                         if j == jokey and i < len(siralar)]
+            if j_siralar:
+                jokey_istatistik[jokey] = {
+                    "kosu": sayi,
+                    "ort_sira": round(sum(j_siralar) / len(j_siralar), 1),
+                    "kazanma": sum(1 for s in j_siralar if s == 1),
+                    "ilk3": sum(1 for s in j_siralar if s <= 3),
+                }
+
     # ── Tutarlılık analizi ─────────────────────────────
     tutarlilik = "—"
+    tutarlilik_skor = 0
     if len(siralar) >= 4:
         std = (sum((s - ort_s)**2 for s in siralar) / len(siralar)) ** 0.5
-        if std <= 1.5:   tutarlilik = "🟢 ÇOK TUTARLI"
-        elif std <= 2.5: tutarlilik = "🟡 TUTARLI"
-        elif std <= 4.0: tutarlilik = "🟠 DALGALI"
-        else:            tutarlilik = "🔴 TUTARSIZ"
+        if std <= 1.5:
+            tutarlilik = "🟢 ÇOK TUTARLI"
+            tutarlilik_skor = 3
+        elif std <= 2.5:
+            tutarlilik = "🟡 TUTARLI"
+            tutarlilik_skor = 2
+        elif std <= 4.0:
+            tutarlilik = "🟠 DALGALI"
+            tutarlilik_skor = 1
+        else:
+            tutarlilik = "🔴 TUTARSIZ"
 
     # ── Form notu (son 3 koşu) ─────────────────────────
     if len(son3_s) >= 2:
@@ -1058,6 +1732,47 @@ def analiz_stil(profil: dict) -> dict:
         else:                                  form_notu = "🟡 NORMAL"
     else:
         form_notu = "—"
+
+    # ── Geçmiş yarış derinlik analizi ───────────────────
+    # Son 10 koşudan detaylı özet
+    son10_ozet = []
+    for r in races[:10]:
+        try:
+            sira_r = int(re.sub(r"[^\d]", "", r.get("sira", "") or ""))
+        except (ValueError, TypeError):
+            sira_r = None
+        d_sec = derece_to_sec(r.get("derece", ""))
+        try:
+            msf_r = int(re.sub(r"[^\d]", "", str(r.get("msf", "") or "")))
+        except (ValueError, TypeError):
+            msf_r = 0
+        hiz_ms = round(msf_r / d_sec, 2) if d_sec and msf_r else None
+        son10_ozet.append({
+            "tarih": r.get("tarih", ""),
+            "sehir": r.get("sehir", ""),
+            "mesafe": msf_r,
+            "pist": r.get("pist", ""),
+            "sira": sira_r,
+            "derece": r.get("derece", ""),
+            "hiz_ms": hiz_ms,
+            "jokey": r.get("jokey", ""),
+            "fark": r.get("fark", ""),
+        })
+
+    # ── Stil skoru (genel güç puanı) ──────────────────
+    stil_skor = 0
+    stil_skor += min(30, kazanma * 0.5)             # Kazanma oranı
+    stil_skor += min(20, ilk3 * 0.25)               # İlk 3 oranı
+    stil_skor += min(15, tutarlilik_skor * 5)        # Tutarlılık
+    stil_skor += min(10, mesafe_uyum_skor * 3.3)     # Mesafe uyumu
+    stil_skor += min(10, pist_uyum_skor * 5)          # Pist uyumu
+    if form_notu in ("🔥 ZİRVEDE", "🟢 FORMDA"):
+        stil_skor += 15
+    elif form_notu == "📈 YÜKSELİYOR":
+        stil_skor += 10
+    elif form_notu == "📉 DÜŞÜŞTE":
+        stil_skor -= 10
+    stil_skor = round(max(0, min(100, stil_skor)), 1)
 
     # Pist tercihi
     ps = profil.get("pist_stats",{})
@@ -1090,51 +1805,258 @@ def analiz_stil(profil: dict) -> dict:
     son5 = "-".join(str(s) for s in siralar[:5]) if siralar else "—"
 
     return {
-        "stil":         stil,
-        "stil_detay":   stil_detay,
-        "ort_sira":     ort_s,
-        "ort_hiz":      ort_h,
-        "ilk3_pct":     ilk3,
-        "kazanma_oran": kazanma,
-        "son5":         son5,
-        "pist_pref":    pist_pref,
-        "pist_kazanma": pist_kazanma,
-        "mesafe_pref":  mesafe_pref,
-        "tutarlilik":   tutarlilik,
-        "form_notu":    form_notu,
-        "taki":         taki_str,
-        "toplam_kosu":  len(siralar),
+        "stil":           stil,
+        "stil_skor":      stil_skor,
+        "stil_detay":     stil_detay,
+        "ort_sira":       ort_s,
+        "ort_hiz":        ort_h,
+        "ilk3_pct":       ilk3,
+        "kazanma_oran":   kazanma,
+        "son5":           son5,
+        "pist_pref":      pist_pref,
+        "pist_kazanma":   pist_kazanma,
+        "mesafe_pref":    mesafe_pref,
+        "mesafe_detay":   mesafe_detay,
+        "mesafe_uyumu":   mesafe_uyumu,
+        "mesafe_uyum_skor": mesafe_uyum_skor,
+        "pist_uyumu":     pist_uyumu,
+        "pist_uyum_skor": pist_uyum_skor,
+        "jokey_istatistik": jokey_istatistik,
+        "tutarlilik":     tutarlilik,
+        "tutarlilik_skor": tutarlilik_skor,
+        "form_notu":      form_notu,
+        "taki":           taki_str,
+        "toplam_kosu":    len(siralar),
+        "son10_ozet":     son10_ozet,
     }
 
 
-def analiz_perform(profil: dict, n: int = 5) -> dict:
-    """Son N koşunun hız trendi."""
-    races = sorted(profil.get("races",[]),
-                   key=lambda r: parse_date_key(r.get("tarih","")), reverse=True)
-    races = races[:n]
+def analiz_perform(profil: dict, n: int = 8) -> dict:
+    """Gelişmiş performans trendi — tüm yarışları tarayarak hız, derece, mesafe analizi."""
+    all_races = sorted(profil.get("races", []),
+                       key=lambda r: parse_date_key(r.get("tarih", "")), reverse=True)
+    races = all_races[:n]
     hizlar = []
-    for r in races:
-        d = derece_to_sec(r.get("derece",""))
+    hiz_detay = []  # [{tarih, mesafe, pist, hiz_ms, derece, sira}]
+    for r in all_races:  # Tüm yarışları tara
+        d = derece_to_sec(r.get("derece", ""))
         try:
-            msf = int(re.sub(r"[^\d]","",str(r.get("msf","") or "")))
-            h   = msf/d if d and d>0 else None
-            if h: hizlar.append(h)
-        except: pass
+            msf = int(re.sub(r"[^\d]", "", str(r.get("msf", "") or "")))
+            h = msf / d if d and d > 0 else None
+        except (ValueError, TypeError):
+            h = None
+            msf = 0
+        try:
+            sira = int(re.sub(r"[^\d]", "", r.get("sira", "") or ""))
+        except (ValueError, TypeError):
+            sira = None
+        if h:
+            hiz_detay.append({
+                "tarih": r.get("tarih", ""),
+                "mesafe": msf, "pist": r.get("pist", ""),
+                "hiz_ms": round(h, 3), "derece": r.get("derece", ""),
+                "sira": sira, "jokey": r.get("jokey", ""),
+            })
+    # Son N koşu hızları
+    hizlar = [hd["hiz_ms"] for hd in hiz_detay[:n]]
 
     trend_skor = 0.0
     if len(hizlar) >= 2:
-        trend_skor = round(hizlar[0]-hizlar[-1], 3)
+        trend_skor = round(hizlar[0] - hizlar[-1], 3)
 
-    if trend_skor > 0.15:   trend = "🟢 YÜKSELİYOR"
+    if trend_skor > 0.15:    trend = "🟢 YÜKSELİYOR"
     elif trend_skor < -0.15: trend = "🔴 DÜŞÜYOR"
     else:                    trend = "🟡 STABİL"
 
+    # ── Mesafe bazlı en iyi hızlar ──
+    from collections import defaultdict
+    msf_hizlar = defaultdict(list)
+    for hd in hiz_detay:
+        msf = hd["mesafe"]
+        if msf <= 1200:    msf_hizlar["Sprint"].append(hd["hiz_ms"])
+        elif msf <= 1600:  msf_hizlar["Orta"].append(hd["hiz_ms"])
+        elif msf <= 2000:  msf_hizlar["Klasik"].append(hd["hiz_ms"])
+        else:              msf_hizlar["Uzun"].append(hd["hiz_ms"])
+
+    mesafe_en_iyi = {}
+    for grp, vals in msf_hizlar.items():
+        mesafe_en_iyi[grp] = {
+            "en_iyi": round(max(vals), 3),
+            "ort": round(sum(vals) / len(vals), 3),
+            "sayi": len(vals),
+        }
+
+    # ── Pist bazlı performans ──
+    pist_hizlar = defaultdict(list)
+    for hd in hiz_detay:
+        p = hd.get("pist", "").strip()
+        if p:
+            pist_hizlar[p].append(hd["hiz_ms"])
+    pist_perform = {}
+    for p, vals in pist_hizlar.items():
+        pist_perform[p] = {
+            "en_iyi": round(max(vals), 3),
+            "ort": round(sum(vals) / len(vals), 3),
+            "sayi": len(vals),
+        }
+
+    # ── Kazandığı koşulardaki hız profili ──
+    kazandigi = [hd for hd in hiz_detay if hd.get("sira") == 1]
+    kazanma_hiz = None
+    if kazandigi:
+        kazanma_hiz = round(sum(hd["hiz_ms"] for hd in kazandigi) / len(kazandigi), 3)
+
+    # ── Son 3 koşu momentum (hız değişim ivmesi) ──
+    momentum = "—"
+    if len(hizlar) >= 3:
+        delta1 = hizlar[0] - hizlar[1]  # son → önceki
+        delta2 = hizlar[1] - hizlar[2]  # önceki → daha önceki
+        ivme = delta1 - delta2
+        if ivme > 0.1:
+            momentum = "🚀 İVMELENİYOR"
+        elif ivme < -0.1:
+            momentum = "📉 İVME KAYBI"
+        else:
+            momentum = "➡️ SABİT İVME"
+
     return {
-        "trend":      trend,
-        "trend_skor": trend_skor,
-        "en_iyi_hiz": round(max(hizlar),3) if hizlar else None,
-        "ort_hiz_ms": round(sum(hizlar)/len(hizlar),3) if hizlar else None,
+        "trend":          trend,
+        "trend_skor":     trend_skor,
+        "en_iyi_hiz":     round(max(hizlar), 3) if hizlar else None,
+        "ort_hiz_ms":     round(sum(hizlar) / len(hizlar), 3) if hizlar else None,
+        "hiz_detay":      hiz_detay[:n],
+        "mesafe_en_iyi":  mesafe_en_iyi,
+        "pist_perform":   pist_perform,
+        "kazanma_hiz":    kazanma_hiz,
+        "momentum":       momentum,
+        "toplam_yaris":   len(hiz_detay),
     }
+
+
+def analiz_genel_yaris(atlar: list, galop_an: dict, stiller: dict,
+                       performlar: dict, tempo_an: dict,
+                       kosu_mesafe: int = 0, kosu_pist: str = "") -> list:
+    """
+    Tüm veri kaynaklarını birleştiren kapsamlı yarış analizi.
+    Her at için birleşik güç puanı, detaylı yorum ve tahmin üretir.
+    """
+    ref = mesafe_tempo_bilgisi(kosu_mesafe, kosu_pist) if kosu_mesafe else None
+    sonuclar = []
+
+    for at in atlar:
+        adi = at.get("at", "")
+        g = galop_an.get(adi, {})
+        s = stiller.get(adi, {})
+        p = performlar.get(adi, {})
+        t = tempo_an.get(adi, {})
+
+        # ── 1. Galop Puanı (max 25) ──
+        galop_puan = 0.0
+        if g.get("en_iyi_400"):
+            galop_puan += max(0, min(15, (27 - g["en_iyi_400"]) * 3))
+        if g.get("galop_trend_skor"):
+            galop_puan += min(5, g["galop_trend_skor"] * 5)
+        if g.get("galop_yogunluk") in ("🔥 YOĞUN", "🟢 AKTİF"):
+            galop_puan += 5
+        galop_puan = min(25, galop_puan)
+
+        # ── 2. Form/Stil Puanı (max 25) ──
+        stil_puan = 0.0
+        stil_puan += min(10, s.get("kazanma_oran", 0) * 0.2)
+        stil_puan += min(8, s.get("ilk3_pct", 0) * 0.1)
+        if s.get("form_notu") in ("🔥 ZİRVEDE", "🟢 FORMDA"):
+            stil_puan += 7
+        elif s.get("form_notu") == "📈 YÜKSELİYOR":
+            stil_puan += 4
+        elif s.get("form_notu") == "📉 DÜŞÜŞTE":
+            stil_puan -= 3
+        stil_puan = max(0, min(25, stil_puan))
+
+        # ── 3. Mesafe/Pist Uyum Puanı (max 20) ──
+        uyum_puan = 0.0
+        uyum_puan += min(12, s.get("mesafe_uyum_skor", 0) * 4)
+        uyum_puan += min(8, s.get("pist_uyum_skor", 0) * 4)
+        uyum_puan = min(20, uyum_puan)
+
+        # ── 4. Performans Trend Puanı (max 15) ──
+        trend_puan = 0.0
+        if p.get("trend_skor"):
+            trend_puan += min(8, p["trend_skor"] * 20)
+        if p.get("momentum") == "🚀 İVMELENİYOR":
+            trend_puan += 5
+        elif p.get("momentum") == "📉 İVME KAYBI":
+            trend_puan -= 3
+        # Referans karşılaştırması
+        if ref and p.get("ort_hiz_ms"):
+            ref_orta = ref["ort_hiz_ms"][1]
+            if p["ort_hiz_ms"] >= ref_orta:
+                trend_puan += 2
+        trend_puan = max(0, min(15, trend_puan))
+
+        # ── 5. Tempo Puanı (max 15) ──
+        tempo_puan = 0.0
+        if t:
+            tempo_puan += min(8, t.get("tempo_skor", 0) * 0.08)
+            if t.get("ref_seviye") == "🟢 İYİ":
+                tempo_puan += 4
+            elif t.get("ref_seviye") == "🟡 ORTA":
+                tempo_puan += 2
+            if t.get("pace_fark", 0) > 0.3:
+                tempo_puan += 3  # Kapanış gücü
+        tempo_puan = max(0, min(15, tempo_puan))
+
+        # ── Toplam Güç Puanı ──
+        toplam = round(galop_puan + stil_puan + uyum_puan +
+                       trend_puan + tempo_puan, 1)
+
+        # ── Yorum Üretimi ──
+        guclu = []
+        zayif = []
+        if galop_puan >= 18: guclu.append("Galop çok güçlü")
+        elif galop_puan <= 8: zayif.append("Galop zayıf")
+        if stil_puan >= 18: guclu.append("Form üst düzey")
+        elif stil_puan <= 5: zayif.append("Form düşük")
+        if uyum_puan >= 15: guclu.append("Mesafe/pist uyumlu")
+        elif uyum_puan <= 5: zayif.append("Mesafe/pist uyumsuz")
+        if trend_puan >= 10: guclu.append("Trend yükselen")
+        elif trend_puan <= 3: zayif.append("Trend düşüşte")
+        if tempo_puan >= 10: guclu.append("Tempo üstün")
+
+        yorum = ""
+        if guclu: yorum += "💪 " + ", ".join(guclu)
+        if zayif: yorum += (" | " if yorum else "") + "⚠️ " + ", ".join(zayif)
+        if not yorum: yorum = "Dengeli profil"
+
+        # Tahmini sıra (basit sıralama için)
+        sonuclar.append({
+            "at": adi,
+            "no": at.get("no", ""),
+            "jokey": at.get("jokey", ""),
+            "kilo": at.get("kilo", ""),
+            "toplam_puan": toplam,
+            "galop_puan": round(galop_puan, 1),
+            "stil_puan": round(stil_puan, 1),
+            "uyum_puan": round(uyum_puan, 1),
+            "trend_puan": round(trend_puan, 1),
+            "tempo_puan": round(tempo_puan, 1),
+            "form": s.get("form_notu", "—"),
+            "stil": s.get("stil", "—"),
+            "mesafe_uyumu": s.get("mesafe_uyumu", "—"),
+            "pist_uyumu": s.get("pist_uyumu", "—"),
+            "trend": p.get("trend", "—"),
+            "momentum": p.get("momentum", "—"),
+            "galop_trend": g.get("galop_trend", "—"),
+            "tutarlilik": s.get("tutarlilik", "—"),
+            "yorum": yorum,
+        })
+
+    sonuclar.sort(key=lambda x: x["toplam_puan"], reverse=True)
+
+    # Tahmini sıra ata
+    for i, s in enumerate(sonuclar):
+        s["tahmin_sira"] = i + 1
+
+    return sonuclar
 
 
 # ─── Ana Uygulama ─────────────────────────────────────────
@@ -1142,7 +2064,7 @@ def analiz_perform(profil: dict, n: int = 5) -> dict:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("🏇  At Yarışı Pro Analiz  v13.0")
+        self.title("🏇  At Yarışı Pro Analiz  v14.0")
         self.geometry("1700x960")
         self.minsize(1200,720)
         self.configure(bg=BG)
@@ -1157,6 +2079,7 @@ class App(tk.Tk):
         self.performlar = {}      # {at: analiz_perform}
         self.tjk_trakus = []      # scrape_tjk_sonuclar sonucu
         self.tempo_an   = {}      # analiz_tempo sonucu
+        self.genel_yaris_sonuc = []  # analiz_genel_yaris sonucu
         self._ready     = False
 
         self._build_ui()
@@ -1370,6 +2293,7 @@ class App(tk.Tk):
             ("  👁  Takip Atları  ",     self._build_takip_tab),
             ("  🎬  Yarış Senaryosu  ", self._build_senaryo_tab),
             ("  🏁  Trakus & Tempo  ",  self._build_trakus_tab),
+            ("  🎯  Genel Yarış Analizi  ", self._build_genel_yaris_tab),
         ]
         self.tab_frames = {}
         for name, builder in tabs:
@@ -2051,6 +2975,13 @@ class App(tk.Tk):
         done  = 0
         self.profiller.clear(); self.stiller.clear(); self.performlar.clear()
 
+        # Koşu mesafe ve pist bilgisi
+        try:
+            k_mesafe = int(kosu.get("mesafe", "0"))
+        except (ValueError, TypeError):
+            k_mesafe = 0
+        k_pist = kosu.get("pist", "")
+
         for at in atlar:
             url = at.get("at_url","")
             if not url: continue
@@ -2060,7 +2991,7 @@ class App(tk.Tk):
             try:
                 profil = scrape_profil(url)
                 self.profiller[at_adi] = profil
-                self.stiller[at_adi]   = analiz_stil(profil)
+                self.stiller[at_adi]   = analiz_stil(profil, k_mesafe, k_pist)
                 self.performlar[at_adi]= analiz_perform(profil)
             except Exception as e:
                 self._st(f"Profil hatası ({at_adi}): {e}")
@@ -2079,6 +3010,7 @@ class App(tk.Tk):
         self._update_takip()
         self._update_senaryo()
         self._update_trakus_tab()
+        self._update_genel_yaris()
 
     # ── Genel Analiz ─────────────────────────────────────
 
@@ -2092,16 +3024,24 @@ class App(tk.Tk):
             s   = self.stiller.get(adi,{})
             p   = self.performlar.get(adi,{})
 
-            # Birleşik skor
+            # Birleşik skor (gelişmiş)
             skor = 0.0
             if g.get("en_iyi_400"):
-                skor += max(0, min(40, (27-g["en_iyi_400"])*5))
+                skor += max(0, min(30, (27-g["en_iyi_400"])*4))
             if g.get("gun_fark") is not None:
-                skor += max(0, 10-g["gun_fark"]*0.5)
+                skor += max(0, 8-g["gun_fark"]*0.4)
+            if g.get("galop_trend_skor"):
+                skor += min(7, g["galop_trend_skor"] * 5)
             if s.get("ilk3_pct"):
-                skor += s["ilk3_pct"]*0.3
+                skor += s["ilk3_pct"]*0.25
+            if s.get("stil_skor"):
+                skor += s["stil_skor"] * 0.1
+            if s.get("mesafe_uyum_skor"):
+                skor += s["mesafe_uyum_skor"] * 3
             if p.get("trend_skor"):
-                skor += p["trend_skor"]*30
+                skor += p["trend_skor"]*25
+            if p.get("momentum") == "🚀 İVMELENİYOR":
+                skor += 5
             skor = round(skor, 1)
 
             rows.append({
@@ -2111,10 +3051,15 @@ class App(tk.Tk):
                 "Hnd":         at.get("hnd",""),
                 "Son5_Form":   s.get("son5","—"),
                 "Kosu_Stili":  s.get("stil","—"),
+                "Stil_Skor":   s.get("stil_skor",""),
                 "Ilk3_%":      s.get("ilk3_pct",""),
                 "En_Iyi_400":  g.get("en_iyi_400",""),
+                "Galop_Trend": g.get("galop_trend","—"),
                 "Son_Galop":   g.get("gun_fark",""),
                 "Trend":       p.get("trend","—"),
+                "Momentum":    p.get("momentum","—"),
+                "Msf_Uyum":    s.get("mesafe_uyumu","—"),
+                "Tutarlılık":  s.get("tutarlilik","—"),
                 "Taki":        at.get("taki",""),
                 "Skor":        skor,
             })
@@ -2222,8 +3167,15 @@ class App(tk.Tk):
             df = df.drop(columns=["_date","_400s","_gun","_hiz_skor","_taze","_skor"],
                          errors="ignore")
 
-        show = ["Skor","no","at","Tazelik","g_tarih",
-                "400","600","800","1000","g_sehir","kg","jokey","pist"]
+        # Galop trend ve yoğunluk bilgisi ekle
+        if not df.empty and "at" in df.columns:
+            df["Galop_Trend"] = df["at"].apply(
+                lambda a: self.galop_an.get(a, {}).get("galop_trend", "—"))
+            df["Yoğunluk"] = df["at"].apply(
+                lambda a: self.galop_an.get(a, {}).get("galop_yogunluk", "—"))
+
+        show = ["Skor","no","at","Tazelik","Galop_Trend","Yoğunluk","g_tarih",
+                "400","600","800","1000","1200","1400","g_sehir","kg","jokey","pist"]
         show = [c for c in show if not df.empty and c in df.columns]
 
         def tag_fn(row, idx):
@@ -3776,6 +4728,8 @@ class App(tk.Tk):
                 "At": at,
                 "Tempo_Profili": t.get("tempo_profil", "—"),
                 "Tempo_Skor": t.get("tempo_skor", ""),
+                "Ref_Seviye": t.get("ref_seviye", "—"),
+                "Ref_Fark": t.get("ref_fark", "—"),
                 "Pace_Yorum": pace_yorum,
                 "Ort_Hız(m/s)": t.get("ort_hiz", ""),
                 "Max_Hız(m/s)": t.get("max_hiz", ""),
@@ -3786,6 +4740,8 @@ class App(tk.Tk):
                 "Pace_Fark": t.get("pace_fark", ""),
                 "Son200(m/s)": t.get("son_200_hiz", ""),
                 "Son400(m/s)": t.get("son_400_hiz", ""),
+                "Mesafe": t.get("kosu_mesafe", ""),
+                "Pist": t.get("kosu_pist", ""),
                 "Sıra": t.get("sira", ""),
                 "Derece": t.get("derece", ""),
                 "Poz_Değişim": t.get("poz_degisim", "—"),
@@ -3959,9 +4915,56 @@ class App(tk.Tk):
                 lines.append("")
                 lines.append("📊 ORT HIZ SIRALAMASI:")
                 for i, (at, t) in enumerate(hiz_sirali[:5], 1):
+                    ref_txt = ""
+                    if t.get("ref_seviye") and t["ref_seviye"] != "—":
+                        ref_txt = f"  [{t['ref_seviye']}]"
                     lines.append(
                         f"   {i}. {at}: {t.get('ort_hiz',0):.2f} m/s  "
-                        f"(max: {t.get('max_hiz',0):.2f})")
+                        f"(max: {t.get('max_hiz',0):.2f}){ref_txt}")
+
+            # ── Mesafe Referans Karşılaştırması ──
+            ref_atlar = [(at, t) for at, t in filtered.items()
+                         if t.get("ref_seviye") and t["ref_seviye"] != "—"]
+            if ref_atlar:
+                lines.append("")
+                lines.append("─" * 60)
+                # Mesafe bilgisi
+                sample = ref_atlar[0][1]
+                msf = sample.get("kosu_mesafe", 0)
+                pist = sample.get("kosu_pist", "")
+                ref_info = mesafe_tempo_bilgisi(msf, pist)
+                if ref_info:
+                    ref_iyi, ref_orta, ref_zayif = ref_info["ort_hiz_ms"]
+                    lines.append(
+                        f"📏 MESAFE REFERANSI: {msf}m {pist}")
+                    lines.append(
+                        f"   Referans hız → İyi: {ref_iyi:.2f}  |  "
+                        f"Orta: {ref_orta:.2f}  |  Zayıf: {ref_zayif:.2f} m/s")
+                    ref_d = ref_info["ref_derece"]
+                    lines.append(
+                        f"   Referans derece → İyi: {derece_formatla(ref_d[0])}  |  "
+                        f"Orta: {derece_formatla(ref_d[1])}  |  "
+                        f"Zayıf: {derece_formatla(ref_d[2])}")
+                    lines.append(f"   Tempo tipi: {ref_info['tempo_tipi']}")
+                    lines.append(f"   {ref_info['aciklama']}")
+                    lines.append("")
+                    lines.append("📊 REFERANSA GÖRE DEĞERLENDİRME:")
+                    for at, t in sorted(ref_atlar,
+                                        key=lambda x: x[1].get("ort_hiz", 0),
+                                        reverse=True):
+                        fark = t.get("ref_fark", 0) or 0
+                        fark_txt = f"+{fark:.2f}" if fark > 0 else f"{fark:.2f}"
+                        lines.append(
+                            f"   {t['ref_seviye']} {at}: "
+                            f"{t.get('ort_hiz',0):.2f} m/s  "
+                            f"(fark: {fark_txt})")
+                        # Seksiyonel karne
+                        karne = t.get("ref_seks_karne", [])
+                        if karne:
+                            karne_txt = " | ".join(
+                                f"{k['bolum']}:{k['durum']}"
+                                for k in karne)
+                            lines.append(f"      Seksiyonel: {karne_txt}")
 
         self.txt_tempo.config(state="normal")
         self.txt_tempo.delete("1.0", "end")
@@ -4092,6 +5095,354 @@ class App(tk.Tk):
                 self.tjk_trakus or [], self.profiller)
             if self.tempo_an:
                 self._on_trakus_done()
+
+    # ── Tab: Genel Yarış Analizi ─────────────────────────
+
+    def _build_genel_yaris_tab(self, parent):
+        """Tüm veri kaynaklarını birleştiren kapsamlı yarış analizi sekmesi."""
+        # Üst bilgi
+        info_f = tk.Frame(parent, bg="#1A2030")
+        info_f.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(info_f,
+                 text=("🎯  GENEL YARIŞ ANALİZİ  —  "
+                       "Galop + Stil + Performans + Tempo + Mesafe/Pist Uyumu "
+                       "birleştirilerek tüm atlar için kapsamlı güç puanı hesaplanır."),
+                 font=F_XS, bg="#1A2030", fg=DIM, wraplength=1400,
+                 justify="left", padx=8, pady=4).pack(fill="x")
+
+        # Podium
+        self.gy_podium = tk.Frame(parent, bg=BG)
+        self.gy_podium.pack(fill="x", padx=8, pady=(6, 4))
+
+        # Mesafe referans kartı
+        self.gy_ref_card = tk.Frame(parent, bg=CARD,
+                                     highlightthickness=1,
+                                     highlightbackground=BORDER)
+        self.gy_ref_card.pack(fill="x", padx=8, pady=(0, 4))
+
+        # Orta: ana tablo
+        mid = tk.Frame(parent, bg=BG)
+        mid.pack(fill="both", expand=True, padx=8)
+
+        lp = tk.Frame(mid, bg=BG)
+        lp.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        tk.Label(lp, text="Kapsamlı At Değerlendirmesi — Birleşik Güç Puanı",
+                 font=F_M, bg=BG, fg=TEXT).pack(anchor="w", pady=(0, 4))
+        self.tree_gy = self._make_tree(lp)
+
+        # Sağ: puan dağılım grafiği
+        rp = tk.Frame(mid, bg=BG, width=420)
+        rp.pack(side="left", fill="both")
+        rp.pack_propagate(False)
+        tk.Label(rp, text="Güç Puanı Dağılımı",
+                 font=F_M, bg=BG, fg=TEXT).pack(anchor="w", pady=(0, 4))
+        self.cv_gy = tk.Canvas(rp, bg=PANEL,
+                                highlightthickness=1,
+                                highlightbackground=BORDER)
+        self.cv_gy.pack(fill="both", expand=True)
+        self.cv_gy.bind("<Configure>", lambda e: self._draw_gy_chart())
+
+        # Alt: detaylı rapor
+        bt = tk.Frame(parent, bg=BG)
+        bt.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Label(bt, text="Yarış Raporu:", font=F_S, bg=BG, fg=GOLD
+                 ).pack(side="left")
+        self.txt_gy = tk.Text(bt, bg=PANEL, fg=TEXT, font=F_XS,
+                               height=8, relief="flat",
+                               highlightthickness=1,
+                               highlightbackground=BORDER,
+                               state="disabled", wrap="word")
+        self.txt_gy.pack(fill="x", expand=True, padx=(6, 0))
+
+    def _update_genel_yaris(self):
+        """Genel yarış analizi sekmesini güncelle."""
+        if not self.sel_kosu:
+            return
+
+        kosu = self.sel_kosu
+        try:
+            k_mesafe = int(kosu.get("mesafe", "0"))
+        except (ValueError, TypeError):
+            k_mesafe = 0
+        k_pist = kosu.get("pist", "")
+
+        sonuclar = analiz_genel_yaris(
+            kosu.get("atlar", []),
+            self.galop_an, self.stiller,
+            self.performlar, self.tempo_an,
+            k_mesafe, k_pist)
+
+        self.genel_yaris_sonuc = sonuclar
+
+        # Tablo
+        rows = []
+        for s in sonuclar:
+            rows.append({
+                "Sıra": s["tahmin_sira"],
+                "No": s["no"],
+                "At": s["at"],
+                "Güç_Puanı": s["toplam_puan"],
+                "Galop": s["galop_puan"],
+                "Stil": s["stil_puan"],
+                "Uyum": s["uyum_puan"],
+                "Trend": s["trend_puan"],
+                "Tempo": s["tempo_puan"],
+                "Form": s["form"],
+                "Koşu_Stili": s["stil"],
+                "Mesafe_Uyum": s["mesafe_uyumu"],
+                "Pist_Uyum": s["pist_uyumu"],
+                "Momentum": s["momentum"],
+                "Galop_Trend": s["galop_trend"],
+                "Tutarlılık": s["tutarlilik"],
+                "Yorum": s["yorum"],
+            })
+
+        df = pd.DataFrame(rows) if rows else pd.DataFrame()
+
+        def tag_fn(row, idx):
+            if idx == 0: return "g1"
+            if idx == 1: return "g2"
+            if idx == 2: return "g3"
+            yorum = str(row.get("Yorum", ""))
+            if "💪" in yorum and "⚠️" not in yorum:
+                return "up"
+            if "⚠️" in yorum and "💪" not in yorum:
+                return "dn"
+            return "odd" if idx % 2 == 0 else "ev"
+
+        self._fill_tree(self.tree_gy, df, tag_fn=tag_fn)
+
+        # Podium
+        self._draw_gy_podium(sonuclar[:3] if sonuclar else [])
+
+        # Mesafe referans kartı
+        self._draw_gy_ref_card(k_mesafe, k_pist)
+
+        # Rapor
+        self._write_gy_rapor(sonuclar, k_mesafe, k_pist)
+
+        # Grafik
+        self.after(100, self._draw_gy_chart)
+
+    def _draw_gy_podium(self, top3):
+        for w in self.gy_podium.winfo_children():
+            w.destroy()
+        if not top3:
+            return
+
+        tk.Label(self.gy_podium, text="🎯  Tahmini En Güçlü Adaylar",
+                 font=F_M, bg=BG, fg=TEXT).pack(side="left", padx=(0, 16))
+
+        colors = [GOLD, SILVER, BRONZE]
+        medals = ["🥇", "🥈", "🥉"]
+        for i, s in enumerate(top3):
+            c = tk.Frame(self.gy_podium, bg=CARD,
+                         highlightthickness=2,
+                         highlightbackground=colors[i],
+                         padx=14, pady=8)
+            c.pack(side="left", padx=(0, 10))
+            tk.Label(c, text=f"{medals[i]} {s['at']}",
+                     font=F_M, bg=CARD, fg=TEXT).pack()
+            tk.Label(c, text=f"Güç: {s['toplam_puan']}",
+                     font=("Segoe UI", 12, "bold"), bg=CARD,
+                     fg=colors[i]).pack()
+            det = (f"{s['form']}  |  {s['stil']}")
+            tk.Label(c, text=det, font=F_XS, bg=CARD, fg=DIM).pack()
+            det2 = (f"G:{s['galop_puan']} S:{s['stil_puan']} "
+                    f"U:{s['uyum_puan']} T:{s['trend_puan']} "
+                    f"Te:{s['tempo_puan']}")
+            tk.Label(c, text=det2, font=F_XS, bg=CARD, fg=DIM
+                     ).pack(pady=(2, 0))
+
+    def _draw_gy_ref_card(self, mesafe, pist):
+        """Mesafe referans bilgi kartını çiz."""
+        for w in self.gy_ref_card.winfo_children():
+            w.destroy()
+
+        if not mesafe:
+            tk.Label(self.gy_ref_card, text="Mesafe bilgisi mevcut değil",
+                     font=F_XS, bg=CARD, fg=DIM, padx=8, pady=4).pack()
+            return
+
+        ref = mesafe_tempo_bilgisi(mesafe, pist)
+        if not ref:
+            tk.Label(self.gy_ref_card,
+                     text=f"📏 {mesafe}m {pist} — Referans verisi bulunamadı",
+                     font=F_XS, bg=CARD, fg=DIM, padx=8, pady=4).pack()
+            return
+
+        # Başlık
+        tk.Label(self.gy_ref_card,
+                 text=f"📏  MESAFE REFERANSI: {mesafe}m {pist}",
+                 font=F_S, bg=CARD, fg=GOLD, padx=8, pady=(4, 2)
+                 ).pack(anchor="w")
+
+        # Detay satırı
+        ref_d = ref["ref_derece"]
+        ref_h = ref["ort_hiz_ms"]
+        detail = (f"Derece → İyi: {derece_formatla(ref_d[0])} | "
+                  f"Orta: {derece_formatla(ref_d[1])} | "
+                  f"Zayıf: {derece_formatla(ref_d[2])}    "
+                  f"Hız → İyi: {ref_h[0]:.2f} | "
+                  f"Orta: {ref_h[1]:.2f} | "
+                  f"Zayıf: {ref_h[2]:.2f} m/s    "
+                  f"Tip: {ref['tempo_tipi']}")
+        tk.Label(self.gy_ref_card, text=detail,
+                 font=F_XS, bg=CARD, fg=TEXT, padx=8, pady=(0, 2)
+                 ).pack(anchor="w")
+
+        tk.Label(self.gy_ref_card, text=ref["aciklama"],
+                 font=F_XS, bg=CARD, fg=DIM, padx=8, pady=(0, 4)
+                 ).pack(anchor="w")
+
+    def _write_gy_rapor(self, sonuclar, mesafe, pist):
+        """Kapsamlı yarış raporu."""
+        lines = []
+        if not sonuclar:
+            lines.append("Henüz analiz yapılmadı.")
+        else:
+            lines.append(f"🎯 KAPSAMLI YARIŞ ANALİZ RAPORU")
+            lines.append(f"   Mesafe: {mesafe}m  |  Pist: {pist or '—'}  |  "
+                         f"{len(sonuclar)} at değerlendirildi")
+            lines.append("═" * 65)
+
+            # Favori grubu
+            lines.append("")
+            lines.append("🏆 FAVORİ GRUBU (En yüksek güç puanı):")
+            for s in sonuclar[:3]:
+                lines.append(
+                    f"   {s['tahmin_sira']}. {s['at']} — Güç: {s['toplam_puan']}")
+                lines.append(
+                    f"      [G:{s['galop_puan']} S:{s['stil_puan']} "
+                    f"U:{s['uyum_puan']} T:{s['trend_puan']} "
+                    f"Te:{s['tempo_puan']}]")
+                lines.append(f"      {s['yorum']}")
+
+            # Sürpriz adayları
+            surpriz = [s for s in sonuclar[3:] if s["toplam_puan"] >= 35]
+            if surpriz:
+                lines.append("")
+                lines.append("⚡ SÜRPRİZ ADAYLARI:")
+                for s in surpriz[:3]:
+                    lines.append(
+                        f"   {s['tahmin_sira']}. {s['at']} — Güç: {s['toplam_puan']}")
+                    lines.append(f"      {s['yorum']}")
+
+            # Mesafe uyumlu atlar
+            uyumlu = [s for s in sonuclar
+                      if "ÇOK İYİ" in str(s.get("mesafe_uyumu", ""))]
+            if uyumlu:
+                lines.append("")
+                lines.append("📏 MESAFE UYUMU YÜKSEK:")
+                for s in uyumlu[:4]:
+                    lines.append(f"   • {s['at']}: {s['mesafe_uyumu']}")
+
+            # Form yükselen atlar
+            formda = [s for s in sonuclar
+                      if s.get("form") in ("🔥 ZİRVEDE", "🟢 FORMDA",
+                                            "📈 YÜKSELİYOR")]
+            if formda:
+                lines.append("")
+                lines.append("📈 FORMDA OLAN ATLAR:")
+                for s in formda[:4]:
+                    lines.append(
+                        f"   • {s['at']}: {s['form']}  |  "
+                        f"Momentum: {s['momentum']}  |  "
+                        f"Galop: {s['galop_trend']}")
+
+            # Riskli atlar
+            riskli = [s for s in sonuclar
+                      if "⚠️" in str(s.get("yorum", "")) and
+                      "💪" not in str(s.get("yorum", ""))]
+            if riskli:
+                lines.append("")
+                lines.append("⚠️ RİSKLİ ATLAR:")
+                for s in riskli[:3]:
+                    lines.append(f"   • {s['at']}: {s['yorum']}")
+
+            # Tahmini sıralama
+            lines.append("")
+            lines.append("═" * 65)
+            lines.append("📊 TAHMİNİ SIRALAMASI:")
+            for s in sonuclar:
+                bar_len = int(s["toplam_puan"] / 2)
+                bar = "█" * bar_len + "░" * (50 - bar_len)
+                lines.append(
+                    f"   {s['tahmin_sira']:2d}. {s['at']:<20s} "
+                    f"{bar} {s['toplam_puan']}")
+
+        self.txt_gy.config(state="normal")
+        self.txt_gy.delete("1.0", "end")
+        self.txt_gy.insert("end", "\n".join(lines))
+        self.txt_gy.config(state="disabled")
+
+    def _draw_gy_chart(self):
+        """Güç puanı bar grafiği."""
+        cv = self.cv_gy
+        cv.delete("all")
+        W = cv.winfo_width() or 400
+        H = cv.winfo_height() or 400
+        if not hasattr(self, "genel_yaris_sonuc") or not self.genel_yaris_sonuc:
+            cv.create_text(W // 2, H // 2, text="Analiz bekleniyor",
+                           fill=DIM, font=F_M)
+            return
+
+        sonuclar = self.genel_yaris_sonuc[:10]
+        n = len(sonuclar)
+        if n == 0:
+            return
+
+        PL, PR, PT, PB = 110, 20, 30, 30
+        bar_h = max(12, (H - PT - PB) / n - 4)
+        max_puan = max(s["toplam_puan"] for s in sonuclar) or 1
+
+        cv.create_text(W // 2, 14, text="Güç Puanı Karşılaştırması",
+                       fill=TEXT, font=F_S)
+
+        colors_list = [GOLD, SILVER, BRONZE, GREEN, BLUE,
+                       TEAL, ORANGE, "#9B59B6", DIM, DIM]
+
+        for i, s in enumerate(sonuclar):
+            y = PT + i * (bar_h + 4)
+            # At adı
+            cv.create_text(PL - 5, y + bar_h / 2,
+                           text=s["at"][:12], fill=TEXT,
+                           font=F_XS, anchor="e")
+            # Bar
+            bw = max(5, (s["toplam_puan"] / max_puan) * (W - PL - PR))
+            col = colors_list[i] if i < len(colors_list) else DIM
+            cv.create_rectangle(PL, y, PL + bw, y + bar_h,
+                                fill=col, outline="")
+            # Puan
+            cv.create_text(PL + bw + 5, y + bar_h / 2,
+                           text=f"{s['toplam_puan']}",
+                           fill=TEXT, font=F_XS, anchor="w")
+
+            # Alt bileşenler (küçük renkli bloklar)
+            bx = PL
+            for val, c in [(s["galop_puan"], GREEN),
+                           (s["stil_puan"], BLUE),
+                           (s["uyum_puan"], TEAL),
+                           (s["trend_puan"], ORANGE),
+                           (s["tempo_puan"], "#9B59B6")]:
+                seg_w = (val / max_puan) * (W - PL - PR)
+                if seg_w > 1:
+                    cv.create_rectangle(bx, y + bar_h - 3,
+                                        bx + seg_w, y + bar_h,
+                                        fill=c, outline="")
+                    bx += seg_w
+
+        # Legend
+        ly = H - 18
+        legend = [("Galop", GREEN), ("Stil", BLUE), ("Uyum", TEAL),
+                  ("Trend", ORANGE), ("Tempo", "#9B59B6")]
+        lx = PL
+        for txt, col in legend:
+            cv.create_rectangle(lx, ly, lx + 10, ly + 10,
+                                fill=col, outline="")
+            cv.create_text(lx + 13, ly + 5, text=txt,
+                           fill=DIM, font=F_XS, anchor="w")
+            lx += 60
 
     # ── Export ───────────────────────────────────────────
 
