@@ -1,5 +1,5 @@
 """
-At Yarışı Pro Analiz  v14.0
+At Yarışı Pro Analiz  v15.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 • Yenibeygir günlük bülten otomatik çekim
 • Koşu → At listesi → Galop + Stil + Performans
@@ -2183,7 +2183,7 @@ def analiz_genel_yaris(atlar: list, galop_an: dict, stiller: dict,
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("🏇  At Yarışı Pro Analiz  v14.0")
+        self.title("🏇  At Yarışı Pro Analiz  v15.0")
         self.geometry("1700x960")
         self.minsize(1200,720)
         self.configure(bg=BG)
@@ -2550,6 +2550,18 @@ class App(tk.Tk):
         tk.Label(rp, text="Yarış Geçmişi",
                  font=F_M, bg=BG, fg=TEXT).pack(anchor="w", pady=(0,4))
         self.tree_stil_detail = self._make_tree(rp)
+
+        # Alt: detaylı stil raporu
+        bt = tk.Frame(parent, bg=BG)
+        bt.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Label(bt, text="Koşu Stili Raporu:", font=F_S, bg=BG, fg=GOLD
+                 ).pack(anchor="w")
+        self.txt_stil = tk.Text(bt, bg=PANEL, fg=TEXT, font=F_XS,
+                                 height=10, relief="flat",
+                                 highlightthickness=1,
+                                 highlightbackground=BORDER,
+                                 state="disabled", wrap="word")
+        self.txt_stil.pack(fill="x", expand=True)
 
     # ── Tab: Performans Trendi ───────────────────────────
 
@@ -3651,6 +3663,7 @@ class App(tk.Tk):
         if len(horses)>1:
             self.stil_horse_var.set(horses[1])
             self._refresh_stil_detail()
+        self._write_stil_rapor()
 
     def _refresh_stil_detail(self):
         horse = self.stil_horse_var.get()
@@ -3712,6 +3725,126 @@ class App(tk.Tk):
 
         self._fill_tree(self.tree_stil_detail,
                         df[show] if show else df, tag_fn=tag_fn)
+
+    def _write_stil_rapor(self):
+        """Detaylı koşu stili raporu — stil dağılımı, yarış senaryosu, öneriler."""
+        lines = []
+        if not self.stiller:
+            lines.append("Henüz stil analizi yapılmadı.")
+        else:
+            lines.append(f"📋 KOŞU STİLİ RAPORU — {len(self.stiller)} at analiz edildi")
+            lines.append("═" * 70)
+
+            # Stil gruplarına ayır
+            gruplar = {
+                "ÖNDE GİDER": [], "ÖNDEN TAKİP": [],
+                "GERİDEN ATAĞI": [], "KAPANIŞÇI": [],
+                "ORTADAN": [], "ERKEN YORULAN": [],
+                "DİĞER": []
+            }
+            for at, s in self.stiller.items():
+                stil_txt = s.get("stil", "")
+                placed = False
+                for gk in gruplar:
+                    if gk in stil_txt:
+                        gruplar[gk].append((at, s))
+                        placed = True
+                        break
+                if not placed:
+                    gruplar["DİĞER"].append((at, s))
+
+            # Yarış senaryosu
+            lines.append("")
+            lines.append("🏁 YARIŞ SENARYOSU:")
+            lines.append("─" * 50)
+            onde = gruplar["ÖNDE GİDER"] + gruplar["ÖNDEN TAKİP"]
+            if onde:
+                lines.append(f"   ⚡ ÖNÜ ÇEKECEK: " +
+                             ", ".join(f"{a}(skor:{s.get('stil_skor',0)})" for a, s in onde))
+                if len(onde) >= 3:
+                    lines.append("      ⚠ Çok kalabalık ön grup → tempo yüksek olabilir → kapanışçılara avantaj!")
+                elif len(onde) <= 1:
+                    lines.append("      ⚠ Tek kaçak at → kendi temposunu dikte edebilir!")
+            else:
+                lines.append("   ⚠ Belirgin kaçak at yok — ortadan gidişli koşu olabilir")
+
+            geri = gruplar["GERİDEN ATAĞI"] + gruplar["KAPANIŞÇI"]
+            if geri:
+                lines.append(f"   🔵 KAPANICI: " +
+                             ", ".join(f"{a}(skor:{s.get('stil_skor',0)})" for a, s in geri))
+                if len(onde) >= 3:
+                    lines.append("      ✅ Tempolu yarışta kapanışçılar avantajlı!")
+
+            orta = gruplar["ORTADAN"]
+            if orta:
+                lines.append(f"   🟡 ORTADAN: " +
+                             ", ".join(a for a, _ in orta))
+
+            yorulan = gruplar["ERKEN YORULAN"]
+            if yorulan:
+                lines.append(f"   🔴 RİSKLİ (erken yorulma): " +
+                             ", ".join(a for a, _ in yorulan))
+
+            # Form + tutarlılık sıralaması
+            lines.append("")
+            lines.append("─" * 50)
+            lines.append("📊 FORM + TUTARLILIK SIRASI:")
+            formlu = sorted(self.stiller.items(),
+                            key=lambda x: x[1].get("stil_skor", 0), reverse=True)
+            for i, (at, s) in enumerate(formlu[:8], 1):
+                form = s.get("form_notu", "—")
+                tutar = s.get("tutarlilik", "—")
+                skor = s.get("stil_skor", 0)
+                son5 = s.get("son5", "—")
+                msf_u = s.get("mesafe_uyumu", "—")
+                if isinstance(msf_u, str) and len(msf_u) > 30:
+                    msf_u = msf_u[:30]
+                lines.append(
+                    f"   {i:2d}. {at:<18s} Skor:{skor:5.1f}  "
+                    f"Form:{form}  Tutarlılık:{tutar}")
+                lines.append(
+                    f"       Son5: {son5}  |  Mesafe: {msf_u}")
+
+            # Trakus pozisyon verisi olan atlar
+            trakus_atlar = [(at, s) for at, s in self.stiller.items()
+                            if s.get("pozisyon_profili")]
+            if trakus_atlar:
+                lines.append("")
+                lines.append("─" * 50)
+                lines.append("📡 TRAKUS POZİSYON VERİSİ:")
+                for at, s in trakus_atlar:
+                    pp = s["pozisyon_profili"]
+                    erken = pp.get("erken_poz", "—")
+                    son = pp.get("son_poz", "—")
+                    deg = pp.get("poz_degisim", 0)
+                    deg_str = f"+{deg}" if deg > 0 else str(deg)
+                    lines.append(
+                        f"   🐎 {at}: Erken={erken} → Son={son} "
+                        f"(değişim: {deg_str})  {s.get('stil','')}")
+
+            # Jokey analizi
+            lines.append("")
+            lines.append("─" * 50)
+            lines.append("🏇 JOKEY ETKİSİ:")
+            for at, s in sorted(self.stiller.items(),
+                                key=lambda x: x[1].get("stil_skor", 0), reverse=True)[:6]:
+                ji = s.get("jokey_istatistik", {})
+                if ji:
+                    best_j = max(ji.items(),
+                                 key=lambda x: x[1].get("kazanma", 0) + x[1].get("ilk3", 0),
+                                 default=(None, {}))
+                    if best_j[0]:
+                        istat = best_j[1]
+                        lines.append(
+                            f"   {at}: En iyi jokey → {best_j[0]} "
+                            f"({istat.get('kosu',0)} koşu, "
+                            f"kaz:{istat.get('kazanma',0)}, "
+                            f"ilk3:{istat.get('ilk3',0)})")
+
+        self.txt_stil.config(state="normal")
+        self.txt_stil.delete("1.0", "end")
+        self.txt_stil.insert("end", "\n".join(lines))
+        self.txt_stil.config(state="disabled")
 
     # ── Trend Tab ─────────────────────────────────────────
 
