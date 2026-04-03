@@ -806,15 +806,52 @@ def scrape_bulten(tarih: str, sehir: str) -> dict:
 
 
 def scrape_galoplar(tarih: str, sehir: str, kosu_no: int) -> list:
-    """Koşunun galop sayfasını çek."""
+    """Koşunun galop sayfasını çek — birden fazla URL pattern dener."""
     from bs4 import BeautifulSoup
-    url = f"https://yenibeygir.com/{tarih_url(tarih)}/{sehir_url(sehir)}/{kosu_no}/galoplar"
-    html = fetch(url)
+
+    sehir_s = sehir_url(sehir)
+    tarih_s = tarih_url(tarih)
+
+    # Yenibeygir URL pattern'leri (yapı değişebilir)
+    urls = [
+        f"https://yenibeygir.com/{tarih_s}/{sehir_s}/{kosu_no}/galoplar",
+        f"https://yenibeygir.com/{tarih_s}/{sehir_s}/{kosu_no}/galop",
+        f"https://www.yenibeygir.com/{tarih_s}/{sehir_s}/{kosu_no}/galoplar",
+    ]
+
+    html = None
+    last_err = ""
+    for url in urls:
+        try:
+            html = fetch(url)
+            if html and len(html) > 200:
+                break
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    if not html or len(html) < 200:
+        raise Exception(
+            f"Galop sayfası açılamadı.\n"
+            f"Denenen URL'ler:\n" +
+            "\n".join(f"  • {u}" for u in urls) +
+            f"\n\nHata: {last_err}\n"
+            f"Olası nedenler:\n"
+            f"• Bugün {sehir.title()}'da yarış yok\n"
+            f"• Site yapısı değişmiş olabilir\n"
+            f"• İnternet bağlantısı kontrol edin")
+
     soup = BeautifulSoup(html, "html.parser")
 
     tables = soup.find_all("table")
     if not tables:
-        raise Exception(f"Galop tablosu bulunamadı: {url}")
+        # Tablo yoksa div tabanlı yapıyı dene
+        divs = soup.find_all("div", class_=re.compile(r"galop|race|horse", re.I))
+        if not divs:
+            raise Exception(
+                f"Galop tablosu bulunamadı.\n"
+                f"Sayfa boyutu: {len(html)} byte\n"
+                f"Site yapısı değişmiş olabilir.")
 
     rows = []
     cur_at = ""
@@ -829,43 +866,60 @@ def scrape_galoplar(tarih: str, sehir: str, kosu_no: int) -> list:
         if m:
             at_txt = a.get_text(strip=True).upper()
             if at_txt:
-                horse_urls[at_txt] = f"https://yenibeygir.com/at/{m.group(1)}/{m.group(2)}"
+                full_url = href if href.startswith("http") else f"https://yenibeygir.com{href}"
+                horse_urls[at_txt] = full_url
 
     col_keys = ["400","600","800","1000","1200","1400"]
-    for tr in tables[0].find_all("tr"):
-        tds = tr.find_all(["td","th"])
-        if not tds: continue
-        text0 = tds[0].get_text(" ", strip=True)
 
-        # At başlık satırı
-        if len(tds) <= 4 and re.search(r"[A-ZÇĞİÖŞÜ]{3,}", text0):
-            m = re.match(r"(\d+)\s+([A-ZÇĞİÖŞÜ\s\(\)]+)", text0)
-            if m:
-                cur_no  = m.group(1).strip()
-                cur_at  = m.group(2).strip()
-                cur_url = horse_urls.get(cur_at, "")
-            continue
+    # Tüm tablolarda galop verisi ara
+    for table in tables:
+        for tr in table.find_all("tr"):
+            tds = tr.find_all(["td","th"])
+            if not tds: continue
+            text0 = tds[0].get_text(" ", strip=True)
 
-        # Galop veri satırı
-        if len(tds) >= 8:
-            cells = [td.get_text(" ", strip=True) for td in tds]
-            if not re.match(r"\d{2}\.\d{2}\.\d{4}", cells[0]): continue
-            row = {
-                "kosu_no": kosu_no,
-                "no":      cur_no,
-                "at":      cur_at,
-                "at_url":  cur_url,
-                "g_tarih": cells[0],
-                "g_sehir": cells[1] if len(cells)>1 else "",
-                "kg":      cells[2] if len(cells)>2 else "",
-                "jokey":   cells[3] if len(cells)>3 else "",
-                "cikis":   cells[-2] if len(cells)>=2 else "",
-                "pist":    cells[-1],
-            }
-            for i, k in enumerate(col_keys):
-                v = cells[4+i] if (4+i) < len(cells) else ""
-                row[k] = v if v not in ("-","","Kenter","ÇR") else ""
-            rows.append(row)
+            # At başlık satırı — esnek regex
+            if len(tds) <= 5 and re.search(r"[A-ZÇĞİÖŞÜ]{3,}", text0):
+                m = re.match(r"(\d+)\s+([A-ZÇĞİÖŞÜa-zçğıöşü\s\(\)\-']+)", text0)
+                if m:
+                    cur_no  = m.group(1).strip()
+                    cur_at  = m.group(2).strip().upper()
+                    cur_url = horse_urls.get(cur_at, "")
+                continue
+
+            # Galop veri satırı
+            if len(tds) >= 6:
+                cells = [td.get_text(" ", strip=True) for td in tds]
+                if not re.match(r"\d{2}\.\d{2}\.\d{4}", cells[0]): continue
+                if not cur_at: continue
+
+                row = {
+                    "kosu_no": kosu_no,
+                    "no":      cur_no,
+                    "at":      cur_at,
+                    "at_url":  cur_url,
+                    "g_tarih": cells[0],
+                    "g_sehir": cells[1] if len(cells)>1 else "",
+                    "kg":      cells[2] if len(cells)>2 else "",
+                    "jokey":   cells[3] if len(cells)>3 else "",
+                    "cikis":   cells[-2] if len(cells)>=2 else "",
+                    "pist":    cells[-1],
+                }
+                for i, k in enumerate(col_keys):
+                    v = cells[4+i] if (4+i) < len(cells) else ""
+                    row[k] = v if v not in ("-","","Kenter","ÇR","R") else ""
+                rows.append(row)
+
+        if rows:
+            break  # İlk geçerli tabloyu bulduk
+
+    if not rows:
+        raise Exception(
+            f"Galop verisi parse edilemedi.\n"
+            f"Tablo sayısı: {len(tables)}\n"
+            f"Olası nedenler:\n"
+            f"• Bu koşu için galop kaydı yok\n"
+            f"• Yenibeygir sayfa yapısı değişmiş")
 
     return rows
 
@@ -2370,14 +2424,35 @@ class App(tk.Tk):
     # ── Tab: Genel Analiz ────────────────────────────────
 
     def _build_genel_tab(self, parent):
+        # Koşu bilgi kartı
+        self.genel_kosu_card = tk.Frame(parent, bg=CARD,
+                                         highlightthickness=1,
+                                         highlightbackground=BORDER)
+        self.genel_kosu_card.pack(fill="x", padx=8, pady=(6, 0))
+        self.genel_kosu_lbl = tk.Label(self.genel_kosu_card,
+                                        text="Koşu seçilmedi",
+                                        font=F_S, bg=CARD, fg=GOLD,
+                                        padx=8, pady=4, justify="left")
+        self.genel_kosu_lbl.pack(anchor="w")
+
         # Podium
         self.pod = tk.Frame(parent, bg=BG)
-        self.pod.pack(fill="x", padx=8, pady=(8,4))
+        self.pod.pack(fill="x", padx=8, pady=(6,4))
 
-        tk.Label(parent, text="Tüm Atlar — Birleşik Skor (Galop + Stil + Performans)",
+        tk.Label(parent, text="Tüm Atlar — Birleşik Skor (Galop + Stil + Performans + Uyum)",
                  font=F_M, bg=BG, fg=TEXT).pack(anchor="w", padx=8, pady=(0,4))
 
         self.tree_genel = self._make_tree(parent)
+
+        # Alt: hızlı özet rapor
+        bt = tk.Frame(parent, bg=BG)
+        bt.pack(fill="x", padx=8, pady=(0, 6))
+        self.txt_genel = tk.Text(bt, bg=PANEL, fg=TEXT, font=F_XS,
+                                  height=6, relief="flat",
+                                  highlightthickness=1,
+                                  highlightbackground=BORDER,
+                                  state="disabled", wrap="word")
+        self.txt_genel.pack(fill="x", expand=True)
 
     # ── Tab: Galop Detay ─────────────────────────────────
 
@@ -2418,6 +2493,18 @@ class App(tk.Tk):
                                    highlightthickness=1, highlightbackground=BORDER)
         self.cv_galop.pack(fill="both", expand=True)
         self.cv_galop.bind("<Configure>", lambda e: self._draw_galop_bar())
+
+        # Alt: detaylı galop raporu
+        bt = tk.Frame(parent, bg=BG)
+        bt.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Label(bt, text="Galop Raporu:", font=F_S, bg=BG, fg=GOLD
+                 ).pack(side="left")
+        self.txt_galop = tk.Text(bt, bg=PANEL, fg=TEXT, font=F_XS,
+                                  height=8, relief="flat",
+                                  highlightthickness=1,
+                                  highlightbackground=BORDER,
+                                  state="disabled", wrap="word")
+        self.txt_galop.pack(fill="x", expand=True, padx=(6, 0))
 
     # ── Tab: Koşu Stili ──────────────────────────────────
 
@@ -3151,6 +3238,60 @@ class App(tk.Tk):
         # Podium
         self._draw_podium(df.head(3).to_dict("records") if not df.empty else [])
 
+        # Koşu bilgi kartı
+        kosu = self.sel_kosu
+        if kosu:
+            msf = kosu.get("mesafe", "—")
+            pist = kosu.get("pist", "—")
+            ref = mesafe_tempo_bilgisi(int(msf), pist) if msf and msf.isdigit() else None
+            info_txt = (f"📋 {kosu.get('no','')}. Koşu  |  "
+                       f"Saat: {kosu.get('saat','—')}  |  "
+                       f"Mesafe: {msf}m  |  Pist: {pist}  |  "
+                       f"Cins: {kosu.get('cins','—')}  |  "
+                       f"{len(kosu.get('atlar',[]))} at")
+            if ref:
+                ref_d = ref["ref_derece"]
+                info_txt += (f"\n📏 Ref Derece: İyi={derece_formatla(ref_d[0])} "
+                            f"Orta={derece_formatla(ref_d[1])} "
+                            f"Zayıf={derece_formatla(ref_d[2])}  |  "
+                            f"{ref['tempo_tipi']}")
+            self.genel_kosu_lbl.config(text=info_txt)
+
+        # Özet rapor
+        self._write_genel_ozet(df)
+
+    def _write_genel_ozet(self, df):
+        """Genel analiz hızlı özet rapor."""
+        lines = []
+        if df is None or df.empty:
+            lines.append("Analiz bekleniyor…")
+        else:
+            top3 = df.head(3).to_dict("records")
+            lines.append(f"🏆 İLK 3 FAVORİ: " +
+                         " | ".join(f"{r.get('At','')}: {r.get('Skor','')}" for r in top3))
+            # Formda olanlar
+            formda = df[df["Trend"].str.contains("YÜKSELİYOR", na=False)]
+            if not formda.empty:
+                lines.append("📈 FORMU YÜKSELEN: " +
+                             ", ".join(formda["At"].head(4).tolist()))
+            # Hazırlıklı olanlar
+            if "Galop_Trend" in df.columns:
+                hizli = df[df["Galop_Trend"].str.contains("HIZLANIYOR", na=False)]
+                if not hizli.empty:
+                    lines.append("🔥 GALOP HIZLANIYOR: " +
+                                 ", ".join(hizli["At"].head(4).tolist()))
+            # Mesafe uyumlu
+            if "Msf_Uyum" in df.columns:
+                uyumlu = df[df["Msf_Uyum"].str.contains("ÇOK İYİ|İYİ", na=False)]
+                if not uyumlu.empty:
+                    lines.append("📏 MESAFE UYUMLU: " +
+                                 ", ".join(uyumlu["At"].head(4).tolist()))
+
+        self.txt_genel.config(state="normal")
+        self.txt_genel.delete("1.0", "end")
+        self.txt_genel.insert("end", "\n".join(lines))
+        self.txt_genel.config(state="disabled")
+
     def _draw_podium(self, top3):
         for w in self.pod.winfo_children(): w.destroy()
         tk.Label(self.pod, text="🏆  En Güçlü Adaylar",
@@ -3264,6 +3405,80 @@ class App(tk.Tk):
                         df[show] if show and not df.empty else df,
                         tag_fn=tag_fn)
         self.after(80, self._draw_galop_bar)
+        self._write_galop_rapor()
+
+    def _write_galop_rapor(self):
+        """Detaylı galop raporu — at bazında hazırlık durumu + mesafe analizi."""
+        lines = []
+        if not self.galop_an:
+            lines.append("Henüz galop verisi yok. Bülten çekip koşu analizi yapın.")
+        else:
+            lines.append(f"📋 GALOP RAPORU — {len(self.galop_an)} at analiz edildi")
+            lines.append("═" * 70)
+
+            # Hazırlık sıralaması
+            atlar_hazir = []
+            for at, g in self.galop_an.items():
+                hazirlik = self._galop_hazirlik(at)
+                atlar_hazir.append((at, g, hazirlik))
+
+            # Yarışa hazır olanlar
+            hazirlar = [(a, g, h) for a, g, h in atlar_hazir if "YARIŞA HAZIR" in h or "FORMA" in h]
+            if hazirlar:
+                lines.append("")
+                lines.append("🔥 YARIŞA HAZIR / FORMA GİREN ATLAR:")
+                for at, g, haz in hazirlar:
+                    gun = g.get("gun_fark", "?")
+                    en_iyi = g.get("en_iyi_400")
+                    ort = g.get("ort_400")
+                    trend = g.get("galop_trend", "—")
+                    toplam = g.get("galop_sayisi", 0)
+                    en_iyi_t = f"{en_iyi:.2f}s" if en_iyi else "—"
+                    ort_t = f"{ort:.2f}s" if ort else "—"
+                    lines.append(
+                        f"   🐎 {at}: {haz}")
+                    lines.append(
+                        f"      Son galop: {gun} gün önce | "
+                        f"Toplam: {toplam} galop | "
+                        f"En iyi 400m: {en_iyi_t} | Ort: {ort_t} | {trend}")
+
+                    # Mesafe bazlı dereceler
+                    ma = g.get("mesafe_analiz", {})
+                    if ma:
+                        msf_parts = []
+                        for msf in ["400","600","800","1000","1200","1400"]:
+                            if msf in ma:
+                                msf_parts.append(
+                                    f"{msf}m:{ma[msf]['en_iyi']:.1f}s")
+                        if msf_parts:
+                            lines.append(f"      Mesafe: {' | '.join(msf_parts)}")
+
+            # Soğuk atlar
+            soguklar = [(a, g, h) for a, g, h in atlar_hazir if "SOĞUK" in h or "SOĞUYOR" in h]
+            if soguklar:
+                lines.append("")
+                lines.append("⚫ SOĞUK / UZUN ARA:")
+                for at, g, haz in soguklar:
+                    gun = g.get("gun_fark", "?")
+                    lines.append(f"   • {at}: Son galop {gun} gün önce — {haz}")
+
+            # En iyi 400m sıralaması
+            lines.append("")
+            lines.append("─" * 70)
+            lines.append("📊 EN İYİ 400m SIRALAMASI:")
+            sirali = sorted(self.galop_an.items(),
+                           key=lambda x: x[1].get("en_iyi_400") or 999)
+            for i, (at, g) in enumerate(sirali[:10], 1):
+                en_iyi = g.get("en_iyi_400")
+                if en_iyi:
+                    bar_len = max(0, int((30 - en_iyi) * 5))
+                    bar = "█" * bar_len
+                    lines.append(f"   {i:2d}. {at:<20s} {en_iyi:.2f}s  {bar}")
+
+        self.txt_galop.config(state="normal")
+        self.txt_galop.delete("1.0", "end")
+        self.txt_galop.insert("end", "\n".join(lines))
+        self.txt_galop.config(state="disabled")
 
     def _galop_hazirlik(self, at_adi):
         """Galop verilerinden hazırlık/form durumu belirle."""
